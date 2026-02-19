@@ -44,9 +44,18 @@ class SecureFastMCP(FastMCP):
         """Override to add secure middleware stack for OAuth 2.1."""
         app = super().streamable_http_app()
 
-        # Add middleware in order (first added = outermost layer)
+        # Add middleware in order (first inserted at 0 = outermost = runs first)
+
         # Session Management - extracts session info for MCP context
         app.user_middleware.insert(0, session_middleware)
+
+        # Passthrough auth — HTTP-level 401 for expired/scope-missing tokens.
+        # Inserted after session (index 1) so session runs outermost, then auth.
+        from auth.oauth_config import is_trust_bearer_token_mode
+        if is_trust_bearer_token_mode():
+            from auth.passthrough_token_provider import PassthroughAuthMiddleware
+            app.user_middleware.insert(1, Middleware(PassthroughAuthMiddleware))
+            logger.info("Added PassthroughAuthMiddleware for HTTP-level 401 responses")
 
         # Rebuild middleware stack
         app.middleware_stack = app.build_middleware_stack()
