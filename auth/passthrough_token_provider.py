@@ -5,8 +5,8 @@ Accepts externally-managed Bearer tokens without requiring OAuth client
 credentials (GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET).
 
 The token is assumed to be valid and refreshed by an external service.
-A single call to Google's userinfo endpoint is made to resolve the user's
-email address; no other validation is performed.
+A single direct HTTP call to Google's userinfo endpoint is made to resolve
+the user's email address; no other validation is performed.
 
 Usage:
     MCP_ENABLE_OAUTH21=true
@@ -18,23 +18,28 @@ import logging
 import time
 from typing import List, Optional
 
+import httpx
 from fastmcp.server.auth import AccessToken
-from google.oauth2.credentials import Credentials
 
 from auth.external_oauth_provider import get_session_time
 from auth.oauth_types import WorkspaceAccessToken
 
 logger = logging.getLogger(__name__)
 
+_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
+
 
 class PassthroughTokenProvider:
     """
     Minimal auth provider that trusts externally-managed Bearer tokens.
 
-    Unlike ExternalOAuthProvider, this class does not require OAuth client
-    credentials.  It calls Google's userinfo API using only the raw access
-    token to resolve the caller's email address, then lets all subsequent
-    Google API calls use that token directly.
+    Does NOT use googleapiclient or google.oauth2.credentials — those
+    libraries trigger an automatic token refresh when they receive a 401,
+    which fails without client_id/secret.
+
+    Instead, makes a single direct HTTP GET to Google's userinfo endpoint
+    to resolve the caller's email.  If the token is invalid/expired the
+    endpoint returns 401 and verify_token() returns None (unauthenticated).
     """
 
     def __init__(self, required_scopes: Optional[List[str]] = None):
@@ -42,33 +47,40 @@ class PassthroughTokenProvider:
 
     async def verify_token(self, token: str) -> Optional[AccessToken]:
         """
-        Resolve user identity from a ya29.* Bearer token.
+        Resolve user identity from a ya29.* Bearer token via a direct
+        HTTP request to Google's userinfo endpoint.
 
-        Calls Google's userinfo endpoint with the bare token (no client
-        credentials needed).  Returns a WorkspaceAccessToken on success,
-        None otherwise.
+        Returns a WorkspaceAccessToken on success, None otherwise.
         """
         if not token.startswith("ya29."):
             logger.debug("PassthroughTokenProvider: skipping non-ya29 token")
             return None
 
         try:
-            from auth.google_auth import get_user_info
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    _USERINFO_URL,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
 
-            # Credentials built with just the token - client_id/secret are only
-            # needed for token refresh, which never happens in passthrough mode.
-            credentials = Credentials(token=token)
-
-            user_info = get_user_info(credentials, skip_valid_check=True)
-
-            if not user_info or not user_info.get("email"):
+            if response.status_code != 200:
                 logger.error(
-                    "PassthroughTokenProvider: could not resolve user info from token"
+                    "PassthroughTokenProvider: userinfo returned %s — token may be expired or lack userinfo scope",
+                    response.status_code,
                 )
                 return None
 
-            email = user_info["email"]
-            logger.info(f"PassthroughTokenProvider: resolved token for {email}")
+            user_info = response.json()
+            email = user_info.get("email")
+
+            if not email:
+                logger.error(
+                    "PassthroughTokenProvider: userinfo response missing email field: %s",
+                    user_info,
+                )
+                return None
+
+            logger.info("PassthroughTokenProvider: resolved token for %s", email)
 
             return WorkspaceAccessToken(
                 token=token,
@@ -80,7 +92,7 @@ class PassthroughTokenProvider:
             )
 
         except Exception as exc:
-            logger.error(f"PassthroughTokenProvider: error resolving token: {exc}")
+            logger.error("PassthroughTokenProvider: error resolving token: %s", exc)
             return None
 
     def get_routes(self, **kwargs) -> list:
