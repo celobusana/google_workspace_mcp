@@ -108,6 +108,21 @@ def configure_server_for_http():
             logger.warning("OAuth 2.1 enabled but OAuth credentials not configured")
             return
 
+        # Passthrough mode: no client credentials required, token is trusted as-is.
+        if config.is_external_oauth21_provider() and config.trust_bearer_token:
+            from auth.passthrough_token_provider import PassthroughTokenProvider
+
+            required_scopes: List[str] = sorted(get_current_scopes())
+            provider = PassthroughTokenProvider(required_scopes=required_scopes)
+            # No protocol-level auth; middleware handles token resolution.
+            set_auth_provider(provider)
+            _auth_provider = provider
+            logger.info(
+                "OAuth 2.1 enabled with PASSTHROUGH mode "
+                "(MCP_TRUST_BEARER_TOKEN=true, no client credentials required)"
+            )
+            return
+
         def validate_and_derive_jwt_key(
             jwt_signing_key_override: str | None, client_secret: str
         ) -> bytes:
