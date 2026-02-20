@@ -243,6 +243,17 @@ async def get_authenticated_google_service_oauth21(
     provider = get_auth_provider()
     access_token = get_access_token()
 
+    # In passthrough mode server.auth=None so FastMCP's get_access_token() returns
+    # None, but AuthInfoMiddleware stores the validated WorkspaceAccessToken in
+    # context state.  Fall back to that so the direct-token path is taken.
+    if access_token is None:
+        try:
+            ctx = get_context()
+            if ctx:
+                access_token = ctx.get_state("access_token")
+        except Exception:
+            pass
+
     if provider and access_token:
         token_email = None
         if getattr(access_token, "claims", None):
