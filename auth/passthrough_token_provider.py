@@ -283,6 +283,7 @@ class PassthroughTokenProvider:
 
         return WorkspaceAccessToken(
             token=token,
+            client_id="passthrough",
             scopes=self.required_scopes,
             expires_at=int(time.time()) + get_session_time(),
             claims={"email": email, "sub": user_info.get("id") or user_info.get("sub")},
