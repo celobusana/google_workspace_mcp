@@ -11,6 +11,7 @@ from fastmcp.server.dependencies import get_http_headers
 from auth.external_oauth_provider import get_session_time
 from auth.oauth21_session_store import ensure_session_from_access_token
 from auth.oauth_types import WorkspaceAccessToken
+from auth.token_shape import token_shape
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -195,8 +196,15 @@ class AuthInfoMiddleware(Middleware):
                         else:
                             # Non-Google JWT tokens require verification
                             # SECURITY: Never set authenticated_user_email from unverified tokens
-                            logger.debug(
-                                "Unverified JWT token rejected - only verified tokens accepted"
+                            #
+                            # WARNING, not debug: this is the last gate before
+                            # the tool layer reports "requires an authenticated
+                            # user, but none was found". Silent here means the
+                            # operator sees the symptom and never the cause.
+                            logger.warning(
+                                "Unverified token rejected - only verified Google "
+                                "access tokens are accepted (%s)",
+                                token_shape(token_str),
                             )
                     else:
                         logger.debug("No Bearer token in Authorization header")

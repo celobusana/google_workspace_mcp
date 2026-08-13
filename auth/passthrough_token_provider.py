@@ -33,6 +33,7 @@ from fastmcp.server.auth import AccessToken
 
 from auth.external_oauth_provider import get_session_time
 from auth.oauth_types import WorkspaceAccessToken
+from auth.token_shape import token_shape
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +169,16 @@ class PassthroughAuthMiddleware:
 
         if not auth_value.startswith("Bearer ya29."):
             # Not a ya29 token — pass through; FastMCP / existing auth handles it.
+            if auth_value.startswith("Bearer "):
+                # A caller DID present a bearer and we are about to ignore it.
+                # At debug level this is invisible in production, which is how
+                # a malformed token reached the tool layer and surfaced only as
+                # "requires an authenticated user, but none was found".
+                logger.warning(
+                    "PassthroughAuthMiddleware: bearer present but not a Google "
+                    "access token; passing through unvalidated (%s)",
+                    token_shape(auth_value[len("Bearer "):]),
+                )
             await self.app(scope, receive, send)
             return
 
@@ -256,7 +267,11 @@ class PassthroughTokenProvider:
 
     async def verify_token(self, token: str) -> Optional[AccessToken]:
         if not token.startswith("ya29."):
-            logger.debug("PassthroughTokenProvider: skipping non-ya29 token")
+            logger.warning(
+                "PassthroughTokenProvider: skipping token that is not a Google "
+                "access token (%s)",
+                token_shape(token),
+            )
             return None
 
         # Fast path — user info already resolved by PassthroughAuthMiddleware.
