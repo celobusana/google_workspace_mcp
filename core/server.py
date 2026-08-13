@@ -44,9 +44,18 @@ class SecureFastMCP(FastMCP):
         """Override to add secure middleware stack for OAuth 2.1."""
         app = super().streamable_http_app()
 
-        # Add middleware in order (first added = outermost layer)
+        # Add middleware in order (first inserted at 0 = outermost = runs first)
+
         # Session Management - extracts session info for MCP context
         app.user_middleware.insert(0, session_middleware)
+
+        # Passthrough auth — HTTP-level 401 for expired/scope-missing tokens.
+        # Inserted after session (index 1) so session runs outermost, then auth.
+        from auth.oauth_config import is_trust_bearer_token_mode
+        if is_trust_bearer_token_mode():
+            from auth.passthrough_token_provider import PassthroughAuthMiddleware
+            app.user_middleware.insert(1, Middleware(PassthroughAuthMiddleware))
+            logger.info("Added PassthroughAuthMiddleware for HTTP-level 401 responses")
 
         # Rebuild middleware stack
         app.middleware_stack = app.build_middleware_stack()
@@ -106,6 +115,21 @@ def configure_server_for_http():
     if oauth21_enabled:
         if not config.is_configured():
             logger.warning("OAuth 2.1 enabled but OAuth credentials not configured")
+            return
+
+        # Passthrough mode: no client credentials required, token is trusted as-is.
+        if config.is_external_oauth21_provider() and config.trust_bearer_token:
+            from auth.passthrough_token_provider import PassthroughTokenProvider
+
+            required_scopes: List[str] = sorted(get_current_scopes())
+            provider = PassthroughTokenProvider(required_scopes=required_scopes)
+            # No protocol-level auth; middleware handles token resolution.
+            set_auth_provider(provider)
+            _auth_provider = provider
+            logger.info(
+                "OAuth 2.1 enabled with PASSTHROUGH mode "
+                "(MCP_TRUST_BEARER_TOKEN=true, no client credentials required)"
+            )
             return
 
         def validate_and_derive_jwt_key(

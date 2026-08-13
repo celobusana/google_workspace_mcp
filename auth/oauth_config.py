@@ -54,6 +54,17 @@ class OAuthConfig:
                 "EXTERNAL_OAUTH21_PROVIDER requires MCP_ENABLE_OAUTH21=true"
             )
 
+        # Trust bearer token mode - accepts tokens without OAuth client credentials.
+        # The token is assumed valid and managed externally; only a userinfo call is
+        # made to resolve the user email.  Requires EXTERNAL_OAUTH21_PROVIDER=true.
+        self.trust_bearer_token = (
+            os.getenv("MCP_TRUST_BEARER_TOKEN", "false").lower() == "true"
+        )
+        if self.trust_bearer_token and not self.external_oauth21_provider:
+            raise ValueError(
+                "MCP_TRUST_BEARER_TOKEN requires EXTERNAL_OAUTH21_PROVIDER=true"
+            )
+
         # Stateless mode configuration
         self.stateless_mode = (
             os.getenv("WORKSPACE_MCP_STATELESS_MODE", "false").lower() == "true"
@@ -173,9 +184,24 @@ class OAuthConfig:
         Check if OAuth is properly configured.
 
         Returns:
-            True if OAuth client credentials are available
+            True if OAuth client credentials are available, or if trust bearer
+            token mode is enabled (which requires no client credentials).
         """
+        if self.trust_bearer_token:
+            return True
         return bool(self.client_id and self.client_secret)
+
+    def is_trust_bearer_token_mode(self) -> bool:
+        """
+        Check if trust bearer token mode is enabled.
+
+        In this mode the server accepts externally-managed Bearer tokens without
+        requiring GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET.
+
+        Returns:
+            True if MCP_TRUST_BEARER_TOKEN=true
+        """
+        return self.trust_bearer_token
 
     def get_oauth_base_url(self) -> str:
         """
@@ -442,3 +468,8 @@ def is_stateless_mode() -> bool:
 def is_external_oauth21_provider() -> bool:
     """Check if external OAuth 2.1 provider mode is enabled."""
     return get_oauth_config().is_external_oauth21_provider()
+
+
+def is_trust_bearer_token_mode() -> bool:
+    """Check if trust bearer token mode is enabled (no client credentials required)."""
+    return get_oauth_config().is_trust_bearer_token_mode()
