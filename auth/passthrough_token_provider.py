@@ -32,6 +32,7 @@ import httpx
 from fastmcp.server.auth import AccessToken
 
 from auth.external_oauth_provider import get_session_time
+from auth.scopes import get_current_scopes
 from auth.oauth_types import WorkspaceAccessToken
 from auth.token_shape import token_shape
 
@@ -45,6 +46,20 @@ _DRIVE_ABOUT_URL = "https://www.googleapis.com/drive/v3/about?fields=user"
 _validated_user: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("passthrough_validated_user", default=None)
 )
+
+# The validated token itself, for the tool layer. FastMCP's get_access_token()
+# returns None in passthrough mode (server.auth is None), and the context-state
+# bag that used to carry it upstream now holds only an email, so the token has
+# to travel here or the tool layer falls back to the credential store and
+# refuses the request.
+_validated_token: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+    "passthrough_validated_token", default=None
+)
+
+
+def get_passthrough_access_token() -> Optional[Any]:
+    """The WorkspaceAccessToken for the request in flight, or None."""
+    return _validated_token.get()
 
 
 # ---------------------------------------------------------------------------
@@ -216,8 +231,6 @@ class PassthroughAuthMiddleware:
         if error_type == "insufficient_scope":
             # Include the required scopes so the caller knows what to request.
             try:
-                from auth.scopes import get_current_scopes
-
                 required = sorted(get_current_scopes())
             except Exception:
                 required = []
@@ -253,12 +266,28 @@ class PassthroughAuthMiddleware:
             "PassthroughAuthMiddleware: validated token for %s", user_info["email"]
         )
 
-        # Store resolved user info for PassthroughTokenProvider (Layer 2).
-        token_ctx = _validated_user.set(user_info)
+        # Store resolved user info for PassthroughTokenProvider (Layer 2) and
+        # the token itself for the tool layer.
+        token_str = auth_value[len("Bearer ") :]
+        access_token = WorkspaceAccessToken(
+            token=token_str,
+            client_id="passthrough",
+            scopes=sorted(get_current_scopes()),
+            expires_at=int(time.time()) + get_session_time(),
+            claims={
+                "email": user_info["email"],
+                "sub": user_info.get("id") or user_info.get("sub"),
+            },
+            email=user_info["email"],
+            sub=user_info.get("id") or user_info.get("sub"),
+        )
+        user_ctx = _validated_user.set(user_info)
+        tok_ctx = _validated_token.set(access_token)
         try:
             await self.app(scope, receive, send)
         finally:
-            _validated_user.reset(token_ctx)
+            _validated_token.reset(tok_ctx)
+            _validated_user.reset(user_ctx)
 
 
 # ---------------------------------------------------------------------------

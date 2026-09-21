@@ -25,6 +25,7 @@ from auth.oauth21_session_store import (
     get_oauth21_session_store,
     ensure_session_from_access_token,
 )
+from auth.passthrough_token_provider import get_passthrough_access_token
 from auth.oauth_config import (
     is_oauth21_enabled,
     get_oauth_config,
@@ -400,16 +401,12 @@ async def get_authenticated_google_service_oauth21(
     provider = get_auth_provider()
     access_token = get_access_token()
 
-    # In passthrough mode server.auth=None so FastMCP's get_access_token() returns
-    # None, but AuthInfoMiddleware stores the validated WorkspaceAccessToken in
-    # context state.  Fall back to that so the direct-token path is taken.
+    # In passthrough mode server.auth=None, so FastMCP's get_access_token()
+    # returns None. PassthroughAuthMiddleware publishes the token it validated;
+    # read it so the direct-token path below is taken instead of the credential
+    # store, which has no grant for an externally-issued token.
     if access_token is None:
-        try:
-            ctx = get_context()
-            if ctx:
-                access_token = await ctx.get_state("access_token")
-        except Exception:
-            pass
+        access_token = get_passthrough_access_token()
 
     if provider and access_token:
         token_email = None
