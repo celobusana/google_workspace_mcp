@@ -51,6 +51,7 @@ _validated_user: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
 # Internal helper
 # ---------------------------------------------------------------------------
 
+
 async def _resolve_user_info(
     token: str,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -128,13 +129,16 @@ async def _send_json_response(
                     v.encode() if isinstance(v, str) else v,
                 )
             )
-    await send({"type": "http.response.start", "status": status_code, "headers": headers})
+    await send(
+        {"type": "http.response.start", "status": status_code, "headers": headers}
+    )
     await send({"type": "http.response.body", "body": body_bytes, "more_body": False})
 
 
 # ---------------------------------------------------------------------------
 # Layer 1 — Starlette ASGI middleware
 # ---------------------------------------------------------------------------
+
 
 class PassthroughAuthMiddleware:
     """
@@ -177,19 +181,21 @@ class PassthroughAuthMiddleware:
                 logger.warning(
                     "PassthroughAuthMiddleware: bearer present but not a Google "
                     "access token; passing through unvalidated (%s)",
-                    token_shape(auth_value[len("Bearer "):]),
+                    token_shape(auth_value[len("Bearer ") :]),
                 )
             await self.app(scope, receive, send)
             return
 
-        token = auth_value[len("Bearer "):]
+        token = auth_value[len("Bearer ") :]
 
         try:
             user_info, error_type = await _resolve_user_info(token)
         except Exception as exc:
             logger.error("PassthroughAuthMiddleware: unexpected error: %s", exc)
             await _send_json_response(
-                send, 500, {"error": "server_error", "message": "Token validation failed"}
+                send,
+                500,
+                {"error": "server_error", "message": "Token validation failed"},
             )
             return
 
@@ -198,7 +204,12 @@ class PassthroughAuthMiddleware:
                 send,
                 401,
                 {"error": "invalid_token", "message": "Token is expired"},
-                [("WWW-Authenticate", 'Bearer error="invalid_token", error_description="Token is expired"')],
+                [
+                    (
+                        "WWW-Authenticate",
+                        'Bearer error="invalid_token", error_description="Token is expired"',
+                    )
+                ],
             )
             return
 
@@ -206,6 +217,7 @@ class PassthroughAuthMiddleware:
             # Include the required scopes so the caller knows what to request.
             try:
                 from auth.scopes import get_current_scopes
+
                 required = sorted(get_current_scopes())
             except Exception:
                 required = []
@@ -253,6 +265,7 @@ class PassthroughAuthMiddleware:
 # Layer 2 — FastMCP auth provider
 # ---------------------------------------------------------------------------
 
+
 class PassthroughTokenProvider:
     """
     FastMCP auth provider for passthrough mode.
@@ -286,7 +299,8 @@ class PassthroughTokenProvider:
                 return None
             if not user_info:
                 logger.error(
-                    "PassthroughTokenProvider: could not resolve user info (%s)", error_type
+                    "PassthroughTokenProvider: could not resolve user info (%s)",
+                    error_type,
                 )
                 return None
 
