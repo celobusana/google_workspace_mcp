@@ -4,15 +4,96 @@ Google Apps Script MCP Tools
 This module provides MCP tools for interacting with Google Apps Script API.
 """
 
-import logging
 import asyncio
-from typing import List, Dict, Any, Optional
+import logging
+import weakref
+from typing import Any, Dict, List, Optional
+
+from mcp.types import ToolAnnotations
 
 from auth.service_decorator import require_google_service
 from core.server import server
-from core.utils import handle_http_errors
+from core.utils import ObjectList, UserInputError, handle_http_errors
 
 logger = logging.getLogger(__name__)
+
+_VALID_SCRIPT_FILE_TYPES = frozenset({"SERVER_JS", "HTML", "JSON"})
+
+# These locks serialize updates only within this process. Other worker
+# processes or service instances can still race while merging the same script_id.
+_SCRIPT_UPDATE_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _get_script_update_lock(script_id: str) -> asyncio.Lock:
+    """Return the in-process lock that orders updates for one script."""
+    return _SCRIPT_UPDATE_LOCKS.setdefault(script_id, asyncio.Lock())
+
+
+def _normalize_script_file(file: Dict[str, Any]) -> Dict[str, str]:
+    """Return the Script API file fields used for updateContent requests.
+
+    Output-only fields returned by getContent (createTime, functionSet, ...)
+    are dropped. Fields the caller omitted stay omitted so a merge can fall
+    back to the existing value instead of blanking it.
+    """
+    return {
+        key: file[key]
+        for key in ("name", "type", "source")
+        if key in file and file[key] is not None
+    }
+
+
+def _merge_script_files(
+    existing_files: List[Dict[str, Any]],
+    updated_files: List[Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    """Overlay updated files onto the current project.
+
+    Files are keyed by (name, type) because Script API names exclude the
+    extension, so one project may hold both Code.gs and Code.html as "Code".
+    An update that omits `type` falls back to matching by name, but only when
+    exactly one existing file carries that name; otherwise the type cannot be
+    inferred and a UserInputError is raised rather than pushing an untyped file.
+    """
+    merged = {
+        (file["name"], file.get("type")): _normalize_script_file(file)
+        for file in existing_files
+        if file.get("name")
+    }
+
+    for index, file in enumerate(updated_files):
+        name = file.get("name")
+        if not name:
+            raise UserInputError(
+                f"File at index {index} is missing a non-empty 'name'."
+            )
+        file_type = file.get("type")
+        if file_type is not None:
+            if file_type not in _VALID_SCRIPT_FILE_TYPES:
+                raise UserInputError(
+                    f"File '{name}' has unsupported type '{file_type}'; it must "
+                    "be one of SERVER_JS, HTML, or JSON."
+                )
+            if file_type == "JSON" and name != "appsscript":
+                raise UserInputError(
+                    f"JSON file '{name}' must use the manifest name 'appsscript'."
+                )
+
+        key = (name, file_type)
+        if key not in merged and file_type is None:
+            same_name = [existing for existing in merged if existing[0] == name]
+            if len(same_name) != 1:
+                raise UserInputError(
+                    f"File '{name}' is missing 'type'; it must be one of "
+                    "SERVER_JS, HTML, or JSON because the existing project "
+                    "does not identify a single file with that name."
+                )
+            key = same_name[0]
+        merged[key] = {**merged.get(key, {}), **_normalize_script_file(file)}
+
+    return list(merged.values())
 
 
 # Internal implementation functions for testing
@@ -69,7 +150,15 @@ async def _list_script_projects_impl(
     return "\n".join(output)
 
 
-@server.tool()
+@server.tool(
+    title="List Script Projects",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("list_script_projects", is_read_only=True, service_type="drive")
 @require_google_service("drive", "drive_read")
 async def list_script_projects(
@@ -141,7 +230,15 @@ async def _get_script_project_impl(
     return "\n".join(output)
 
 
-@server.tool()
+@server.tool(
+    title="Get Script Project",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("get_script_project", is_read_only=True, service_type="script")
 @require_google_service("script", "script_readonly")
 async def get_script_project(
@@ -199,7 +296,15 @@ async def _get_script_content_impl(
     return "\n".join(output)
 
 
-@server.tool()
+@server.tool(
+    title="Get Script Content",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("get_script_content", is_read_only=True, service_type="script")
 @require_google_service("script", "script_readonly")
 async def get_script_content(
@@ -232,7 +337,9 @@ async def _create_script_project_impl(
     parent_id: Optional[str] = None,
 ) -> str:
     """Internal implementation for create_script_project."""
-    logger.info(f"[create_script_project] Email: {user_google_email}, Title: {title}")
+    logger.info(
+        f"[create_script_project] Email: {user_google_email}, title_len={len(title)}"
+    )
 
     request_body = {"title": title}
 
@@ -256,7 +363,15 @@ async def _create_script_project_impl(
     return "\n".join(output)
 
 
-@server.tool()
+@server.tool(
+    title="Create Script Project",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("create_script_project", service_type="script")
 @require_google_service("script", "script_projects")
 async def create_script_project(
@@ -287,30 +402,60 @@ async def _update_script_content_impl(
     user_google_email: str,
     script_id: str,
     files: List[Dict[str, str]],
+    merge: bool = True,
 ) -> str:
     """Internal implementation for update_script_content."""
     logger.info(
-        f"[update_script_content] Email: {user_google_email}, ID: {script_id}, Files: {len(files)}"
+        f"[update_script_content] Email: {user_google_email}, ID: {script_id}, "
+        f"Files: {len(files)}, merge: {merge}"
     )
 
-    request_body = {"files": files}
+    files_to_push = [_normalize_script_file(file) for file in files]
 
-    updated_content = await asyncio.to_thread(
-        service.projects().updateContent(scriptId=script_id, body=request_body).execute
-    )
+    async with _get_script_update_lock(script_id):
+        if merge:
+            current_content = await asyncio.to_thread(
+                service.projects().getContent(scriptId=script_id).execute
+            )
+            files_to_push = _merge_script_files(
+                current_content.get("files", []), files_to_push
+            )
 
-    output = [f"Updated script project: {script_id}", "", "Modified files:"]
+        request_body = {"files": files_to_push}
+
+        updated_content = await asyncio.to_thread(
+            service.projects()
+            .updateContent(scriptId=script_id, body=request_body)
+            .execute
+        )
+
+    mode = "merged into project" if merge else "replaced entire project"
+    output = [
+        f"Updated script project: {script_id} ({mode})",
+        "",
+        "Files in project after update:",
+    ]
 
     for file in updated_content.get("files", []):
         file_name = file.get("name", "Untitled")
         file_type = file.get("type", "Unknown")
         output.append(f"- {file_name} ({file_type})")
 
-    logger.info(f"[update_script_content] Updated {len(files)} files in {script_id}")
+    logger.info(
+        f"[update_script_content] Pushed {len(files_to_push)} files to {script_id}"
+    )
     return "\n".join(output)
 
 
-@server.tool()
+@server.tool(
+    title="Update Script Content",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("update_script_content", service_type="script")
 @require_google_service("script", "script_projects")
 async def update_script_content(
@@ -318,21 +463,29 @@ async def update_script_content(
     user_google_email: str,
     script_id: str,
     files: List[Dict[str, str]],
+    merge: bool = True,
 ) -> str:
     """
-    Updates or creates files in a script project.
+    Update or create files in a script project.
+
+    By default this merges the supplied files into the existing project by file
+    name, leaving other files untouched. Set merge=False to replace the entire
+    project: any existing file omitted from `files` is permanently deleted.
 
     Args:
         service: Injected Google API service client
         user_google_email: User's email address
         script_id: The script project ID
-        files: List of file objects with name, type, and source
+        files: File objects with name, type, and source to create or update
+        merge: When True (default), overlay these files onto the current
+            project. When False, replace the full project file set; omitted
+            files are deleted.
 
     Returns:
         str: Formatted string confirming update with file list
     """
     return await _update_script_content_impl(
-        service, user_google_email, script_id, files
+        service, user_google_email, script_id, files, merge
     )
 
 
@@ -343,6 +496,7 @@ async def _run_script_function_impl(
     function_name: str,
     parameters: Optional[list[object]] = None,
     dev_mode: bool = False,
+    deployment_id: Optional[str] = None,
 ) -> str:
     """Internal implementation for run_script_function."""
     logger.info(
@@ -355,8 +509,53 @@ async def _run_script_function_impl(
         request_body["parameters"] = parameters
 
     try:
+        if not deployment_id:
+            all_deployments = []
+            page_token = None
+            while True:
+                list_params = {"scriptId": script_id}
+                if page_token:
+                    list_params["pageToken"] = page_token
+
+                deployments_response = await asyncio.to_thread(
+                    service.projects().deployments().list(**list_params).execute
+                )
+                all_deployments.extend(deployments_response.get("deployments", []))
+                page_token = deployments_response.get("nextPageToken")
+                if not page_token:
+                    break
+
+            deployments = [
+                deployment
+                for deployment in all_deployments
+                if deployment.get("deploymentId")
+                and deployment.get("deploymentConfig", {}).get("versionNumber")
+                is not None
+                and any(
+                    entry_point.get("entryPointType") == "EXECUTION_API"
+                    for entry_point in deployment.get("entryPoints", [])
+                )
+            ]
+
+            if not deployments:
+                return (
+                    "Execution failed\n"
+                    f"Function: {function_name}\n"
+                    "Error: No versioned API Executable deployment was found. In the "
+                    "Apps Script editor, use Deploy > New deployment > API Executable. "
+                    "The script and caller must share a standard Google Cloud project. "
+                    "manage_deployment(action='create') is sufficient only when the "
+                    "script manifest already defines executionApi."
+                )
+
+            latest = max(
+                deployments,
+                key=lambda deployment: deployment["deploymentConfig"]["versionNumber"],
+            )
+            deployment_id = latest["deploymentId"]
+
         response = await asyncio.to_thread(
-            service.scripts().run(scriptId=script_id, body=request_body).execute
+            service.scripts().run(scriptId=deployment_id, body=request_body).execute
         )
 
         if "error" in response:
@@ -381,16 +580,25 @@ async def _run_script_function_impl(
         return f"Execution failed\nFunction: {function_name}\nError: {str(e)}"
 
 
-@server.tool()
+@server.tool(
+    title="Run Script Function",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("run_script_function", service_type="script")
-@require_google_service("script", "script_projects")
+@require_google_service("script", ["script_run", "script_deployments_readonly"])
 async def run_script_function(
     service: Any,
     user_google_email: str,
     script_id: str,
     function_name: str,
-    parameters: Optional[list[object]] = None,
+    parameters: Optional[ObjectList] = None,
     dev_mode: bool = False,
+    deployment_id: Optional[str] = None,
 ) -> str:
     """
     Executes a function in a deployed script.
@@ -402,12 +610,21 @@ async def run_script_function(
         function_name: Name of function to execute
         parameters: Optional list of parameters to pass
         dev_mode: Whether to run latest code vs deployed version
+        deployment_id: Optional API Executable deployment ID. When supplied,
+            skips the automatic deployment lookup. When omitted, the versioned
+            API Executable deployment with the highest version number is used.
 
     Returns:
         str: Formatted string with execution result or error
     """
     return await _run_script_function_impl(
-        service, user_google_email, script_id, function_name, parameters, dev_mode
+        service,
+        user_google_email,
+        script_id,
+        function_name,
+        parameters,
+        dev_mode,
+        deployment_id,
     )
 
 
@@ -423,7 +640,7 @@ async def _create_deployment_impl(
     Creates a new version first, then creates a deployment using that version.
     """
     logger.info(
-        f"[create_deployment] Email: {user_google_email}, ID: {script_id}, Desc: {description}"
+        f"[create_deployment] Email: {user_google_email}, ID: {script_id}, desc_len={len(description) if description else 0}"
     )
 
     # First, create a new version
@@ -463,32 +680,78 @@ async def _create_deployment_impl(
     return "\n".join(output)
 
 
-@server.tool()
-@handle_http_errors("create_deployment", service_type="script")
+@server.tool(
+    title="Manage Deployment",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("manage_deployment", service_type="script")
 @require_google_service("script", "script_deployments")
-async def create_deployment(
+async def manage_deployment(
     service: Any,
     user_google_email: str,
+    action: str,
     script_id: str,
-    description: str,
+    deployment_id: Optional[str] = None,
+    description: Optional[str] = None,
     version_description: Optional[str] = None,
+    version_number: Optional[int] = None,
 ) -> str:
     """
-    Creates a new deployment of the script.
+    Manages Apps Script deployments. Supports creating, updating, and deleting deployments.
 
     Args:
         service: Injected Google API service client
         user_google_email: User's email address
+        action: Action to perform - "create", "update", or "delete"
         script_id: The script project ID
-        description: Deployment description
-        version_description: Optional version description
+        deployment_id: The deployment ID (required for update and delete)
+        description: Deployment description (required for create; optional for update
+            when version_number is supplied)
+        version_description: Optional version description (for create only)
+        version_number: Version number to point the deployment at (for update only).
+            Required to roll a deployment forward to a newly created script version.
 
     Returns:
-        str: Formatted string with deployment details
+        str: Formatted string with deployment details or confirmation
     """
-    return await _create_deployment_impl(
-        service, user_google_email, script_id, description, version_description
-    )
+    action = action.lower().strip()
+    if action == "create":
+        if description is None or description.strip() == "":
+            raise ValueError("description is required for create action")
+        return await _create_deployment_impl(
+            service, user_google_email, script_id, description, version_description
+        )
+    elif action == "update":
+        if not deployment_id:
+            raise ValueError("deployment_id is required for update action")
+        has_description = description is not None and description.strip() != ""
+        if not has_description and version_number is None:
+            raise ValueError(
+                "description or version_number is required for update action"
+            )
+        return await _update_deployment_impl(
+            service,
+            user_google_email,
+            script_id,
+            deployment_id,
+            description,
+            version_number,
+        )
+    elif action == "delete":
+        if not deployment_id:
+            raise ValueError("deployment_id is required for delete action")
+        return await _delete_deployment_impl(
+            service, user_google_email, script_id, deployment_id
+        )
+    else:
+        raise ValueError(
+            f"Invalid action '{action}'. Must be 'create', 'update', or 'delete'."
+        )
 
 
 async def _list_deployments_impl(
@@ -512,10 +775,24 @@ async def _list_deployments_impl(
 
     for i, deployment in enumerate(deployments, 1):
         deployment_id = deployment.get("deploymentId", "Unknown")
-        description = deployment.get("description", "No description")
+        # description and versionNumber live under deploymentConfig; fall back to
+        # any top-level description for forward/backward compatibility.
+        config = deployment.get("deploymentConfig", {})
+        description = (
+            config.get("description")
+            or deployment.get("description")
+            or "No description"
+        )
         update_time = deployment.get("updateTime", "Unknown")
+        # A HEAD deployment has no versionNumber — it always serves the latest
+        # saved content rather than a pinned version.
+        version_number = config.get("versionNumber")
+        version_label = (
+            str(version_number) if version_number is not None else "HEAD (latest)"
+        )
 
         output.append(f"{i}. {description} ({deployment_id})")
+        output.append(f"   Version: {version_label}")
         output.append(f"   Updated: {update_time}")
         output.append("")
 
@@ -523,7 +800,15 @@ async def _list_deployments_impl(
     return "\n".join(output)
 
 
-@server.tool()
+@server.tool(
+    title="List Deployments",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("list_deployments", is_read_only=True, service_type="script")
 @require_google_service("script", "script_deployments_readonly")
 async def list_deployments(
@@ -532,7 +817,8 @@ async def list_deployments(
     script_id: str,
 ) -> str:
     """
-    Lists all deployments for a script project.
+    Lists all deployments for a script project, including the bound version
+    number of each deployment so callers can verify which version is served.
 
     Args:
         service: Injected Google API service client
@@ -540,7 +826,7 @@ async def list_deployments(
         script_id: The script project ID
 
     Returns:
-        str: Formatted string with deployment list
+        str: Formatted string with deployment list (id, description, version, updated time)
     """
     return await _list_deployments_impl(service, user_google_email, script_id)
 
@@ -551,15 +837,27 @@ async def _update_deployment_impl(
     script_id: str,
     deployment_id: str,
     description: Optional[str] = None,
+    version_number: Optional[int] = None,
 ) -> str:
-    """Internal implementation for update_deployment."""
+    """Internal implementation for update_deployment.
+
+    The Apps Script ``projects.deployments.update`` endpoint expects every
+    field nested inside a ``deploymentConfig`` object; sending them at the top
+    level fails with ``400 Invalid JSON payload``. ``scriptId`` is always part
+    of the config, and ``versionNumber`` is required to repoint a deployment at
+    a newer script version.
+    """
     logger.info(
         f"[update_deployment] Email: {user_google_email}, Script: {script_id}, Deployment: {deployment_id}"
     )
 
-    request_body = {}
+    deployment_config: Dict[str, Any] = {"scriptId": script_id}
+    if version_number is not None:
+        deployment_config["versionNumber"] = version_number
     if description:
-        request_body["description"] = description
+        deployment_config["description"] = description
+
+    request_body = {"deploymentConfig": deployment_config}
 
     deployment = await asyncio.to_thread(
         service.projects()
@@ -568,42 +866,21 @@ async def _update_deployment_impl(
         .execute
     )
 
+    deployment_config_resp = deployment.get("deploymentConfig", {})
+    resolved_version = deployment_config_resp.get("versionNumber", version_number)
+    resolved_description = deployment_config_resp.get(
+        "description", deployment.get("description", "No description")
+    )
+
     output = [
         f"Updated deployment: {deployment_id}",
         f"Script: {script_id}",
-        f"Description: {deployment.get('description', 'No description')}",
+        f"Version: {resolved_version if resolved_version is not None else 'unchanged'}",
+        f"Description: {resolved_description}",
     ]
 
     logger.info(f"[update_deployment] Updated deployment {deployment_id}")
     return "\n".join(output)
-
-
-@server.tool()
-@handle_http_errors("update_deployment", service_type="script")
-@require_google_service("script", "script_deployments")
-async def update_deployment(
-    service: Any,
-    user_google_email: str,
-    script_id: str,
-    deployment_id: str,
-    description: Optional[str] = None,
-) -> str:
-    """
-    Updates an existing deployment configuration.
-
-    Args:
-        service: Injected Google API service client
-        user_google_email: User's email address
-        script_id: The script project ID
-        deployment_id: The deployment ID to update
-        description: Optional new description
-
-    Returns:
-        str: Formatted string confirming update
-    """
-    return await _update_deployment_impl(
-        service, user_google_email, script_id, deployment_id, description
-    )
 
 
 async def _delete_deployment_impl(
@@ -630,32 +907,6 @@ async def _delete_deployment_impl(
     return output
 
 
-@server.tool()
-@handle_http_errors("delete_deployment", service_type="script")
-@require_google_service("script", "script_deployments")
-async def delete_deployment(
-    service: Any,
-    user_google_email: str,
-    script_id: str,
-    deployment_id: str,
-) -> str:
-    """
-    Deletes a deployment.
-
-    Args:
-        service: Injected Google API service client
-        user_google_email: User's email address
-        script_id: The script project ID
-        deployment_id: The deployment ID to delete
-
-    Returns:
-        str: Confirmation message
-    """
-    return await _delete_deployment_impl(
-        service, user_google_email, script_id, deployment_id
-    )
-
-
 async def _list_script_processes_impl(
     service: Any,
     user_google_email: str,
@@ -667,13 +918,18 @@ async def _list_script_processes_impl(
         f"[list_script_processes] Email: {user_google_email}, PageSize: {page_size}"
     )
 
-    request_params = {"pageSize": page_size}
     if script_id:
-        request_params["scriptId"] = script_id
-
-    response = await asyncio.to_thread(
-        service.processes().list(**request_params).execute
-    )
+        # processes.list() has no top-level scriptId parameter; the
+        # script-scoped endpoint takes it directly.
+        response = await asyncio.to_thread(
+            service.processes()
+            .listScriptProcesses(scriptId=script_id, pageSize=page_size)
+            .execute
+        )
+    else:
+        response = await asyncio.to_thread(
+            service.processes().list(pageSize=page_size).execute
+        )
 
     processes = response.get("processes", [])
 
@@ -698,7 +954,15 @@ async def _list_script_processes_impl(
     return "\n".join(output)
 
 
-@server.tool()
+@server.tool(
+    title="List Script Processes",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("list_script_processes", is_read_only=True, service_type="script")
 @require_google_service("script", "script_readonly")
 async def list_script_processes(
@@ -714,7 +978,8 @@ async def list_script_processes(
         service: Injected Google API service client
         user_google_email: User's email address
         page_size: Number of results (default: 50)
-        script_id: Optional filter by script ID
+        script_id: Optional script ID. When set, lists all processes for that
+            script visible to the user, including runs by other users.
 
     Returns:
         str: Formatted string with process list
@@ -746,7 +1011,15 @@ async def _delete_script_project_impl(
     return f"Deleted Apps Script project: {script_id}"
 
 
-@server.tool()
+@server.tool(
+    title="Delete Script Project",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("delete_script_project", is_read_only=False, service_type="drive")
 @require_google_service("drive", "drive_full")
 async def delete_script_project(
@@ -807,7 +1080,15 @@ async def _list_versions_impl(
     return "\n".join(output)
 
 
-@server.tool()
+@server.tool(
+    title="List Versions",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("list_versions", is_read_only=True, service_type="script")
 @require_google_service("script", "script_readonly")
 async def list_versions(
@@ -865,7 +1146,15 @@ async def _create_version_impl(
     return "\n".join(output)
 
 
-@server.tool()
+@server.tool(
+    title="Create Version",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("create_version", is_read_only=False, service_type="script")
 @require_google_service("script", "script_full")
 async def create_version(
@@ -926,7 +1215,15 @@ async def _get_version_impl(
     return "\n".join(output)
 
 
-@server.tool()
+@server.tool(
+    title="Get Version",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("get_version", is_read_only=True, service_type="script")
 @require_google_service("script", "script_readonly")
 async def get_version(
@@ -1023,7 +1320,15 @@ async def _get_script_metrics_impl(
     return "\n".join(output)
 
 
-@server.tool()
+@server.tool(
+    title="Get Script Metrics",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("get_script_metrics", is_read_only=True, service_type="script")
 @require_google_service("script", "script_readonly")
 async def get_script_metrics(
@@ -1274,7 +1579,15 @@ def _generate_trigger_code_impl(
     return "\n".join(instructions) + "\n\n" + code
 
 
-@server.tool()
+@server.tool(
+    title="Generate Trigger Code",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
 async def generate_trigger_code(
     trigger_type: str,
     function_name: str,
