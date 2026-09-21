@@ -407,7 +407,7 @@ async def get_authenticated_google_service_oauth21(
         try:
             ctx = get_context()
             if ctx:
-                access_token = ctx.get_state("access_token")
+                access_token = await ctx.get_state("access_token")
         except Exception:
             pass
 
