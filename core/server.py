@@ -460,7 +460,10 @@ def configure_server_for_http():
             )
 
         # Passthrough mode: no client credentials required, token is trusted as-is.
-        if config.is_external_oauth21_provider() and config.trust_bearer_token:
+        # getattr: callers may pass a config object that predates this attribute.
+        if config.is_external_oauth21_provider() and getattr(
+            config, "trust_bearer_token", False
+        ):
             from auth.passthrough_token_provider import PassthroughTokenProvider
 
             required_scopes: List[str] = sorted(get_current_scopes())
