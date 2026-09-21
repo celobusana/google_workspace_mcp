@@ -42,6 +42,9 @@ CHAT_READONLY_SCOPE = "https://www.googleapis.com/auth/chat.messages.readonly"
 CHAT_WRITE_SCOPE = "https://www.googleapis.com/auth/chat.messages"
 CHAT_SPACES_SCOPE = "https://www.googleapis.com/auth/chat.spaces"
 CHAT_SPACES_READONLY_SCOPE = "https://www.googleapis.com/auth/chat.spaces.readonly"
+CHAT_MEMBERSHIPS_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/chat.memberships.readonly"
+)
 
 # Google Sheets API scopes
 SHEETS_READONLY_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
@@ -80,6 +83,10 @@ SCRIPT_DEPLOYMENTS_READONLY_SCOPE = (
 )
 SCRIPT_PROCESSES_READONLY_SCOPE = "https://www.googleapis.com/auth/script.processes"
 SCRIPT_METRICS_SCOPE = "https://www.googleapis.com/auth/script.metrics"
+SCRIPT_EXTERNAL_REQUEST_SCOPE = (
+    "https://www.googleapis.com/auth/script.external_request"
+)
+SCRIPT_SCRIPTAPP_SCOPE = "https://www.googleapis.com/auth/script.scriptapp"
 
 # Google scope hierarchy: broader scopes that implicitly cover narrower ones.
 # See https://developers.google.com/gmail/api/auth/scopes,
@@ -131,6 +138,9 @@ def has_required_scopes(available_scopes, required_scopes):
 # Base OAuth scopes required for user identification
 BASE_SCOPES = [USERINFO_EMAIL_SCOPE, USERINFO_PROFILE_SCOPE, OPENID_SCOPE]
 
+# Minimal scopes required to accept an MCP bearer token at the protocol layer.
+PROTOCOL_AUTH_SCOPES = [USERINFO_EMAIL_SCOPE, OPENID_SCOPE]
+
 # Service-specific scope groups
 DOCS_SCOPES = [
     DOCS_READONLY_SCOPE,
@@ -157,6 +167,8 @@ CHAT_SCOPES = [
     CHAT_WRITE_SCOPE,
     CHAT_SPACES_SCOPE,
     CHAT_SPACES_READONLY_SCOPE,
+    CHAT_MEMBERSHIPS_READONLY_SCOPE,  # Names DMs after their members
+    CONTACTS_READONLY_SCOPE,  # Resolves sender and member names via People API
 ]
 
 SHEETS_SCOPES = [SHEETS_READONLY_SCOPE, SHEETS_WRITE_SCOPE, DRIVE_READONLY_SCOPE]
@@ -182,6 +194,8 @@ SCRIPT_SCOPES = [
     SCRIPT_DEPLOYMENTS_READONLY_SCOPE,
     SCRIPT_PROCESSES_READONLY_SCOPE,  # Required for list_script_processes
     SCRIPT_METRICS_SCOPE,  # Required for get_script_metrics
+    SCRIPT_EXTERNAL_REQUEST_SCOPE,  # Required for scripts.run (execution API)
+    SCRIPT_SCRIPTAPP_SCOPE,  # Required for scripts.run (execution API)
     DRIVE_FILE_SCOPE,  # Required for list/delete script projects (uses Drive API)
 ]
 
@@ -208,7 +222,12 @@ TOOL_READONLY_SCOPES_MAP = {
     "calendar": [CALENDAR_READONLY_SCOPE],
     "docs": [DOCS_READONLY_SCOPE, DRIVE_READONLY_SCOPE],
     "sheets": [SHEETS_READONLY_SCOPE, DRIVE_READONLY_SCOPE],
-    "chat": [CHAT_READONLY_SCOPE, CHAT_SPACES_READONLY_SCOPE],
+    "chat": [
+        CHAT_READONLY_SCOPE,
+        CHAT_SPACES_READONLY_SCOPE,
+        CHAT_MEMBERSHIPS_READONLY_SCOPE,
+        CONTACTS_READONLY_SCOPE,
+    ],
     "forms": [FORMS_BODY_READONLY_SCOPE, FORMS_RESPONSES_READONLY_SCOPE],
     "slides": [SLIDES_READONLY_SCOPE],
     "tasks": [TASKS_READONLY_SCOPE],
@@ -233,7 +252,8 @@ def set_enabled_tools(enabled_tools):
     """
     global _ENABLED_TOOLS
     _ENABLED_TOOLS = enabled_tools
-    logger.info(f"Enabled tools set for scope management: {enabled_tools}")
+    # Debug level: the startup screen already reports the loaded service count.
+    logger.debug(f"Scope management active for {len(enabled_tools)} services")
 
 
 # Global variable to store read-only mode (set by main.py)
@@ -249,7 +269,8 @@ def set_read_only(enabled: bool):
     """
     global _READ_ONLY_MODE
     _READ_ONLY_MODE = enabled
-    logger.info(f"Read-only mode set to: {enabled}")
+    # Debug level: the startup banner already flags read-only mode.
+    logger.debug(f"Read-only mode set to: {enabled}")
 
 
 def is_read_only_mode() -> bool:
@@ -291,6 +312,24 @@ def get_scopes_for_tools(enabled_tools=None):
     Returns:
         List of unique scopes for the enabled tools plus base scopes.
     """
+    # Granular permissions mode overrides both full and read-only scope maps.
+    # Lazy import with guard to avoid circular dependency during module init
+    # (SCOPES = get_scopes_for_tools() runs at import time before auth.permissions
+    # is fully loaded, but permissions mode is never active at that point).
+    try:
+        from auth.permissions import is_permissions_mode, get_all_permission_scopes
+
+        if is_permissions_mode():
+            scopes = BASE_SCOPES.copy()
+            scopes.extend(get_all_permission_scopes())
+            logger.debug(
+                "Generated scopes from granular permissions: %d unique scopes",
+                len(set(scopes)),
+            )
+            return list(set(scopes))
+    except ImportError:
+        pass
+
     if enabled_tools is None:
         # Default behavior - return all scopes
         enabled_tools = TOOL_SCOPES_MAP.keys()

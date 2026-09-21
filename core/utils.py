@@ -1,21 +1,74 @@
+import base64
 import io
+import json
 import logging
 import os
+import posixpath
+import re
+import tempfile
+import urllib.parse
 import zipfile
-import xml.etree.ElementTree as ET
 import ssl
 import asyncio
 import functools
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Annotated, Any, List, Optional
 
+from pydantic import BeforeValidator
+from defusedxml import DefusedXmlException, ElementTree as ET
+
+from fastmcp.exceptions import ToolError
 from googleapiclient.errors import HttpError
 from .api_enablement import get_api_enablement_message
 from auth.google_auth import GoogleAuthenticationError
 from auth.oauth_config import is_oauth21_enabled, is_external_oauth21_provider
 
 logger = logging.getLogger(__name__)
+
+GOOGLE_API_WRITE_RETRIES = 3
+
+_WORDPROCESSINGML_NAMESPACES = {
+    "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    "http://purl.oclc.org/ooxml/wordprocessingml/main",
+}
+_DRAWINGML_NAMESPACES = {
+    "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "http://purl.oclc.org/ooxml/drawingml/main",
+}
+_MARKUP_COMPATIBILITY_NAMESPACE = (
+    "http://schemas.openxmlformats.org/markup-compatibility/2006"
+)
+_PACKAGE_RELATIONSHIPS_NAMESPACE = (
+    "http://schemas.openxmlformats.org/package/2006/relationships"
+)
+_OFFICE_RELATIONSHIP_BASES = {
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "https://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships",
+}
+_DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+_OFFICE_XML_MIME_TYPES = {_DOCX_MIME, _XLSX_MIME, _PPTX_MIME}
+_EXCEL_MAIN_NAMESPACE = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_WORD_TEXT_RELATIONSHIP_KINDS = {"header", "footer", "footnotes", "endnotes"}
+_WORD_TEXT_RELATIONSHIP_TYPES = {
+    f"{base}/{kind}": kind
+    for base in _OFFICE_RELATIONSHIP_BASES
+    for kind in _WORD_TEXT_RELATIONSHIP_KINDS
+}
+_SUPPORTED_TEXT_CHOICE_NAMESPACES = {
+    *_WORDPROCESSINGML_NAMESPACES,
+    *_DRAWINGML_NAMESPACES,
+    "http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas",
+    "http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing",
+    "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup",
+    "http://schemas.microsoft.com/office/word/2010/wordprocessingShape",
+    "http://schemas.microsoft.com/office/word/2010/wordml",
+    "http://schemas.microsoft.com/office/word/2012/wordml",
+    "http://schemas.microsoft.com/office/drawing/2010/main",
+}
 
 
 class TransientNetworkError(Exception):
@@ -30,23 +83,94 @@ class UserInputError(Exception):
     pass
 
 
+def _coerce_json_str_to_type(v: Any, expected_type: type) -> Any:
+    """Coerce a JSON-encoded string to a specific container type."""
+    if not isinstance(v, str):
+        return v
+
+    try:
+        parsed = json.loads(v)
+    except (json.JSONDecodeError, TypeError):
+        return v
+
+    return parsed if isinstance(parsed, expected_type) else v
+
+
+def _coerce_json_str_to_list(v: Any) -> Any:
+    """Coerce a JSON-encoded string to a list.
+
+    Some MCP clients (e.g. Cowork) serialise array parameters as JSON strings
+    rather than native arrays.  This ``BeforeValidator`` transparently converts
+    ``'["a","b"]'`` → ``["a", "b"]`` so Pydantic validation succeeds.
+    """
+    return _coerce_json_str_to_type(v, list)
+
+
+StringList = Annotated[List[str], BeforeValidator(_coerce_json_str_to_list)]
+"""``List[str]`` that also accepts a JSON-encoded string of an array.
+
+Use in tool signatures instead of ``List[str]`` to work around MCP clients
+that send ``'["value"]'`` instead of ``["value"]``.
+"""
+
+
+DictList = Annotated[List[dict[str, Any]], BeforeValidator(_coerce_json_str_to_list)]
+"""``List[dict]`` that also accepts a JSON-encoded string of an array.
+
+Use in tool signatures instead of ``List[dict]`` to work around MCP clients
+that send ``'[{"key":"val"}]'`` instead of ``[{"key":"val"}]``.
+"""
+
+
+ObjectList = Annotated[List[object], BeforeValidator(_coerce_json_str_to_list)]
+"""``List[object]`` that also accepts a JSON-encoded string of an array."""
+
+
+def _coerce_json_str_to_dict(v: Any) -> Any:
+    """Coerce a JSON-encoded string to a dict.
+
+    Some MCP clients serialise dict parameters as JSON strings rather than
+    native objects.  This ``BeforeValidator`` transparently converts
+    ``'{"key":"val"}'`` -> ``{"key": "val"}`` so Pydantic validation succeeds.
+    """
+    return _coerce_json_str_to_type(v, dict)
+
+
+JsonDict = Annotated[dict[str, Any], BeforeValidator(_coerce_json_str_to_dict)]
+"""``dict`` that also accepts a JSON-encoded string of an object.
+
+Use in tool signatures instead of ``Dict[str, Any]`` to work around MCP clients
+that send ``'{"key":"val"}'`` instead of ``{"key": "val"}``.
+"""
+
+
 # Directories from which local file reads are allowed.
-# The user's home directory is the default safe base.
+# By default, only the managed attachment storage directory is trusted.
 # Override via ALLOWED_FILE_DIRS env var (os.pathsep-separated paths).
 _ALLOWED_FILE_DIRS_ENV = "ALLOWED_FILE_DIRS"
 
 
 def _get_allowed_file_dirs() -> list[Path]:
     """Return the list of directories from which local file access is permitted."""
+    from core.attachment_storage import STORAGE_DIR
+
+    allowed_dirs: list[Path] = [STORAGE_DIR]
     env_val = os.environ.get(_ALLOWED_FILE_DIRS_ENV)
     if env_val:
-        return [
-            Path(p).expanduser().resolve()
+        allowed_dirs.extend(
+            Path(p_stripped).expanduser().resolve()
             for p in env_val.split(os.pathsep)
-            if p.strip()
-        ]
-    home = Path.home()
-    return [home] if home else []
+            if (p_stripped := p.strip())
+        )
+
+    unique_dirs: list[Path] = []
+    seen: set[Path] = set()
+    for path in allowed_dirs:
+        if path in seen:
+            continue
+        seen.add(path)
+        unique_dirs.append(path)
+    return unique_dirs
 
 
 def validate_file_path(file_path: str) -> Path:
@@ -76,8 +200,10 @@ def validate_file_path(file_path: str) -> Path:
     resolved_str = str(resolved)
     file_name = resolved.name.lower()
 
+    path_parts = [part.lower() for part in resolved.parts]
+
     # Block .env files and variants (.env, .env.local, .env.production, etc.)
-    if file_name == ".env" or file_name.startswith(".env."):
+    if any(part == ".env" or part.startswith(".env.") for part in path_parts):
         raise ValueError(
             f"Access to '{resolved_str}' is not allowed: "
             ".env files may contain secrets and cannot be read, uploaded, or attached."
@@ -100,16 +226,20 @@ def validate_file_path(file_path: str) -> Path:
                 "path is in a restricted system location."
             )
 
-    # Block sensitive directories that commonly contain credentials/keys
-    sensitive_dirs = (
-        ".ssh",
-        ".aws",
+    # Block sensitive directories that commonly contain credentials/keys.
+    if ".ssh" in path_parts or ".aws" in path_parts:
+        raise ValueError(
+            f"Access to '{resolved_str}' is not allowed: "
+            "path is in a directory that commonly contains secrets or credentials."
+        )
+
+    home = Path.home()
+    sensitive_home_dirs = (
         ".kube",
         ".gnupg",
         ".config/gcloud",
     )
-    for sensitive_dir in sensitive_dirs:
-        home = Path.home()
+    for sensitive_dir in sensitive_home_dirs:
         blocked = home / sensitive_dir
         if resolved == blocked or str(resolved).startswith(str(blocked) + "/"):
             raise ValueError(
@@ -142,7 +272,8 @@ def validate_file_path(file_path: str) -> Path:
     if not allowed_dirs:
         raise ValueError(
             "No allowed file directories configured. "
-            "Set the ALLOWED_FILE_DIRS environment variable or ensure a home directory exists."
+            "Set the ALLOWED_FILE_DIRS environment variable or configure "
+            "WORKSPACE_ATTACHMENT_DIR."
         )
 
     for allowed in allowed_dirs:
@@ -175,201 +306,504 @@ def check_credentials_directory_permissions(credentials_dir: str = None) -> None
 
         credentials_dir = get_default_credentials_dir()
 
+    # Multiple server processes may initialize the same credentials directory at
+    # once. Keep the check idempotent: create the directory if needed, probe with
+    # a unique temporary file, and never remove the shared directory on failure.
     try:
-        # Check if directory exists
-        if os.path.exists(credentials_dir):
-            # Directory exists, check if we can write to it
-            test_file = os.path.join(credentials_dir, ".permission_test")
-            try:
-                with open(test_file, "w") as f:
-                    f.write("test")
-                os.remove(test_file)
-                logger.info(
-                    f"Credentials directory permissions check passed: {os.path.abspath(credentials_dir)}"
-                )
-            except (PermissionError, OSError) as e:
-                raise PermissionError(
-                    f"Cannot write to existing credentials directory '{os.path.abspath(credentials_dir)}': {e}"
-                )
-        else:
-            # Directory doesn't exist, try to create it and its parent directories
-            try:
-                os.makedirs(credentials_dir, exist_ok=True)
-                # Test writing to the new directory
-                test_file = os.path.join(credentials_dir, ".permission_test")
-                with open(test_file, "w") as f:
-                    f.write("test")
-                os.remove(test_file)
-                logger.info(
-                    f"Created credentials directory with proper permissions: {os.path.abspath(credentials_dir)}"
-                )
-            except (PermissionError, OSError) as e:
-                # Clean up if we created the directory but can't write to it
-                try:
-                    if os.path.exists(credentials_dir):
-                        os.rmdir(credentials_dir)
-                except (PermissionError, OSError):
-                    pass
-                raise PermissionError(
-                    f"Cannot create or write to credentials directory '{os.path.abspath(credentials_dir)}': {e}"
-                )
-
-    except PermissionError:
-        raise
-    except Exception as e:
-        raise OSError(
-            f"Unexpected error checking credentials directory permissions: {e}"
+        os.makedirs(credentials_dir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            dir=credentials_dir, prefix=".permission_test_"
+        ) as probe:
+            probe.write(b"test")
+            probe.flush()
+    except (PermissionError, OSError) as e:
+        raise PermissionError(
+            f"Cannot create or write to credentials directory "
+            f"'{os.path.abspath(credentials_dir)}': {e}"
         )
+
+    # Debug level: the startup screen already reports this check and the path.
+    logger.debug(
+        f"Credentials directory permissions check passed: {os.path.abspath(credentials_dir)}"
+    )
+
+
+class OfficeXmlExtractionError(Exception):
+    """Raised when an Office file cannot be read."""
+
+
+def _xml_name(tag: str) -> tuple[Optional[str], str]:
+    """Return an ElementTree tag's namespace URI and local name."""
+    if tag.startswith("{") and "}" in tag:
+        namespace, local_name = tag[1:].split("}", 1)
+        return namespace, local_name
+    return None, tag
+
+
+def _parse_xml_with_choice_namespaces(
+    xml_content: bytes,
+) -> tuple[Any, dict[Any, dict[str, str]]]:
+    """Parse XML and retain the in-scope prefix map for each mc:Choice."""
+    namespaces: dict[str, str] = {}
+    namespace_stack: list[tuple[str, Any]] = []
+    choice_namespaces: dict[Any, dict[str, str]] = {}
+    missing = object()
+    xml_root = None
+
+    for event, value in ET.iterparse(
+        io.BytesIO(xml_content), events=("start-ns", "start", "end-ns")
+    ):
+        if event == "start-ns":
+            prefix, uri = value
+            prefix = prefix or ""
+            namespace_stack.append((prefix, namespaces.get(prefix, missing)))
+            namespaces[prefix] = uri
+        elif event == "end-ns":
+            prefix, previous = namespace_stack.pop()
+            if previous is missing:
+                namespaces.pop(prefix, None)
+            else:
+                namespaces[prefix] = previous
+        else:
+            element = value
+            if xml_root is None:
+                xml_root = element
+            if element.tag == f"{{{_MARKUP_COMPATIBILITY_NAMESPACE}}}Choice":
+                choice_namespaces[element] = namespaces.copy()
+
+    if xml_root is None:
+        raise ET.ParseError("XML member has no root element")
+    return xml_root, choice_namespaces
+
+
+def _resolve_internal_part_target(source_part: str, target: str) -> Optional[str]:
+    """Resolve an OPC internal relationship target to a ZIP member name."""
+    parsed = urllib.parse.urlsplit(target)
+    if parsed.scheme or parsed.netloc or not parsed.path:
+        return None
+
+    target_path = urllib.parse.unquote(parsed.path)
+    if "\\" in target_path:
+        return None
+    if target_path.startswith("/"):
+        resolved = posixpath.normpath(target_path.lstrip("/"))
+    else:
+        resolved = posixpath.normpath(
+            posixpath.join(posixpath.dirname(source_part), target_path)
+        )
+    if resolved in {"", ".", ".."} or resolved.startswith("../"):
+        return None
+    return resolved
+
+
+def _relationship_id(element: Any) -> Optional[str]:
+    """Return an r:id attribute from either Transitional or Strict OOXML."""
+    for attribute, value in element.attrib.items():
+        namespace, local_name = _xml_name(attribute)
+        if namespace in _OFFICE_RELATIONSHIP_BASES and local_name == "id":
+            return value
+    return None
+
+
+def _word_related_text_targets(zf: zipfile.ZipFile, document_root: Any) -> list[str]:
+    """Return active Word text parts using OPC relationships, not filenames."""
+    try:
+        relationships_xml = zf.read("word/_rels/document.xml.rels")
+    except KeyError:
+        return []
+    relationships_root = ET.fromstring(relationships_xml)
+
+    relationships: list[tuple[str, str, str]] = []
+    relationships_by_id: dict[str, tuple[str, str]] = {}
+    for relationship in relationships_root.iter():
+        if _xml_name(relationship.tag) != (
+            _PACKAGE_RELATIONSHIPS_NAMESPACE,
+            "Relationship",
+        ):
+            continue
+        if relationship.get("TargetMode", "Internal").lower() != "internal":
+            continue
+        relationship_id = relationship.get("Id")
+        kind = _WORD_TEXT_RELATIONSHIP_TYPES.get(relationship.get("Type", ""))
+        target = relationship.get("Target")
+        if not relationship_id or not kind or not target:
+            continue
+        resolved = _resolve_internal_part_target("word/document.xml", target)
+        if resolved is None:
+            logger.warning(
+                "Ignoring invalid internal Word relationship target %r", target
+            )
+            continue
+        relationships.append((relationship_id, kind, resolved))
+        relationships_by_id[relationship_id] = (kind, resolved)
+
+    active_header_footer_ids: dict[str, list[str]] = {"header": [], "footer": []}
+    for element in document_root.iter():
+        namespace, local_name = _xml_name(element.tag)
+        if namespace not in _WORDPROCESSINGML_NAMESPACES or local_name not in {
+            "headerReference",
+            "footerReference",
+        }:
+            continue
+        kind = "header" if local_name == "headerReference" else "footer"
+        relationship_id = _relationship_id(element)
+        if relationship_id and relationship_id not in active_header_footer_ids[kind]:
+            active_header_footer_ids[kind].append(relationship_id)
+
+    targets: list[str] = []
+    seen: set[str] = set()
+
+    def add_target(target: str) -> None:
+        if target not in seen:
+            seen.add(target)
+            targets.append(target)
+
+    for kind in ("header", "footer"):
+        for relationship_id in active_header_footer_ids[kind]:
+            relationship = relationships_by_id.get(relationship_id)
+            if relationship is not None and relationship[0] == kind:
+                add_target(relationship[1])
+
+    for wanted_kind in ("footnotes", "endnotes"):
+        for _, kind, target in relationships:
+            if kind == wanted_kind:
+                add_target(target)
+
+    return targets
+
+
+def _branch_has_extractable_text(branch: Any) -> bool:
+    """Whether an AlternateContent branch has text or an explicit separator."""
+    parents = {child: parent for parent in branch.iter() for child in parent}
+    for element in branch.iter():
+        namespace, local_name = _xml_name(element.tag)
+        if local_name == "t" and element.text:
+            return True
+        if namespace in _WORDPROCESSINGML_NAMESPACES and local_name in {
+            "tab",
+            "br",
+            "cr",
+        }:
+            parent = parents.get(element)
+            if parent is not None and _xml_name(parent.tag)[1] == "r":
+                return True
+        if namespace in _DRAWINGML_NAMESPACES and local_name == "br":
+            parent = parents.get(element)
+            if parent is not None and _xml_name(parent.tag)[1] == "p":
+                return True
+    return False
+
+
+def _alternate_content_skip_set(
+    xml_root: Any, choice_namespaces: dict[Any, dict[str, str]]
+) -> set[int]:
+    """Return node IDs belonging to unselected mc:AlternateContent branches."""
+    alternate_tag = f"{{{_MARKUP_COMPATIBILITY_NAMESPACE}}}AlternateContent"
+    choice_tag = f"{{{_MARKUP_COMPATIBILITY_NAMESPACE}}}Choice"
+    fallback_tag = f"{{{_MARKUP_COMPATIBILITY_NAMESPACE}}}Fallback"
+    skip: set[int] = set()
+
+    for alternate in xml_root.iter(alternate_tag):
+        children = list(alternate)
+        choices = [child for child in children if child.tag == choice_tag]
+        fallback = next(
+            (child for child in children if child.tag == fallback_tag), None
+        )
+        selected = None
+        last_resort = None
+        for choice in choices:
+            prefixes = choice.get("Requires", "").split()
+            namespaces = choice_namespaces.get(choice, {})
+            if prefixes and all(
+                namespaces.get(prefix) in _SUPPORTED_TEXT_CHOICE_NAMESPACES
+                for prefix in prefixes
+            ):
+                if _branch_has_extractable_text(choice):
+                    selected = choice
+                    break
+            elif last_resort is None and _branch_has_extractable_text(choice):
+                last_resort = choice
+        if selected is None and fallback is not None:
+            selected = fallback
+        if selected is None and last_resort is not None:
+            selected = last_resort
+
+        for branch in choices + ([fallback] if fallback is not None else []):
+            if branch is selected:
+                continue
+            skip.update(id(node) for node in branch.iter())
+
+    return skip
+
+
+def _read_part(zf: zipfile.ZipFile, name: str) -> bytes:
+    """Read a ZIP member the file cannot be valid without."""
+    try:
+        return zf.read(name)
+    except KeyError as e:
+        raise OfficeXmlExtractionError(f"missing required part: {name}") from e
+
+
+def _read_shared_strings(zf: zipfile.ZipFile) -> Optional[List[str]]:
+    """Return workbook shared strings, or None when the part is absent."""
+    try:
+        shared_strings_xml = zf.read("xl/sharedStrings.xml")
+    except KeyError:
+        return None
+    root = ET.fromstring(shared_strings_xml)
+    return [
+        "".join(t.text or "" for t in si.findall(f".//{{{_EXCEL_MAIN_NAMESPACE}}}t"))
+        for si in root.findall(f"{{{_EXCEL_MAIN_NAMESPACE}}}si")
+    ]
+
+
+def _shared_string(shared_strings: Optional[List[str]], value: str, member: str) -> str:
+    """Resolve a t="s" cell value, rejecting references the workbook cannot satisfy."""
+    if shared_strings is None:
+        raise OfficeXmlExtractionError(
+            f"{member} references shared strings but xl/sharedStrings.xml is missing"
+        )
+    try:
+        index = int(value)
+    except ValueError as e:
+        raise OfficeXmlExtractionError(
+            f"non-integer shared string index {value!r} in {member}"
+        ) from e
+    if not 0 <= index < len(shared_strings):
+        raise OfficeXmlExtractionError(
+            f"shared string index {index} out of range in {member}"
+        )
+    return shared_strings[index]
+
+
+def _spreadsheet_texts(
+    xml_root: Any, shared_strings: Optional[List[str]], member: str
+) -> List[str]:
+    """Return cell values from one worksheet in document order."""
+    texts: List[str] = []
+    for cell in xml_root.iter(f"{{{_EXCEL_MAIN_NAMESPACE}}}c"):
+        value = cell.find(f"{{{_EXCEL_MAIN_NAMESPACE}}}v")
+        if value is None or value.text is None:
+            continue
+        if cell.get("t") == "s":
+            texts.append(_shared_string(shared_strings, value.text, member))
+        else:
+            texts.append(value.text)
+    return texts
+
+
+def _paragraph_texts(
+    xml_root: Any, choice_namespaces: dict[Any, dict[str, str]]
+) -> List[str]:
+    """Return one line per Word/PowerPoint paragraph.
+
+    Runs concatenate without a separator because Word splits tokens across runs.
+    A nested text-box paragraph flushes its outer paragraph so XML order holds
+    without emitting the nested text twice.
+    """
+    parents = {child: parent for parent in xml_root.iter() for child in parent}
+
+    def line_owner(node: Any) -> Any:
+        """Closest paragraph ancestor, else nearest non-run container."""
+        cur = parents.get(node)
+        nearest_non_run = None
+        while cur is not None:
+            local_name = _xml_name(cur.tag)[1]
+            if local_name == "p":
+                return cur
+            if nearest_non_run is None and local_name != "r":
+                nearest_non_run = cur
+            cur = parents.get(cur)
+        return nearest_non_run
+
+    def parent_name(node: Any) -> Optional[str]:
+        parent = parents.get(node)
+        return None if parent is None else _xml_name(parent.tag)[1]
+
+    skip = _alternate_content_skip_set(xml_root, choice_namespaces)
+    lines: List[str] = []
+    current_owner = None
+    current_parts: List[str] = []
+
+    def flush_line() -> None:
+        # Strip space padding only; explicit tabs and breaks are content.
+        line = "".join(current_parts).strip(" ")
+        if line:
+            lines.append(line)
+
+    for node in xml_root.iter():
+        if id(node) in skip:
+            continue
+        namespace, local_name = _xml_name(node.tag)
+        piece = None
+        if local_name == "t" and node.text:
+            piece = node.text
+        elif namespace in _WORDPROCESSINGML_NAMESPACES and local_name in {
+            "tab",
+            "br",
+            "cr",
+        }:
+            # w:tab under w:pPr/w:tabs is a tab stop, not content.
+            if parent_name(node) == "r":
+                piece = "\t" if local_name == "tab" else "\n"
+        elif namespace in _DRAWINGML_NAMESPACES and local_name == "br":
+            if parent_name(node) == "p":
+                piece = "\n"
+        if piece is None:
+            continue
+        owner = line_owner(node) or node
+        if current_owner is not None and owner is not current_owner:
+            flush_line()
+            current_parts = []
+        current_owner = owner
+        current_parts.append(piece)
+
+    flush_line()
+    return lines
 
 
 def extract_office_xml_text(file_bytes: bytes, mime_type: str) -> Optional[str]:
     """
     Very light-weight XML scraper for Word, Excel, PowerPoint files.
-    Returns plain-text if something readable is found, else None.
-    No external deps – just std-lib zipfile + ElementTree.
+    Returns plain text, None when no text is present, and raises
+    OfficeXmlExtractionError when the Office file cannot be read.
+    Uses zipfile + defusedxml.ElementTree.
     """
-    shared_strings: List[str] = []
-    ns_excel_main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    if mime_type not in _OFFICE_XML_MIME_TYPES:
+        return None
 
     try:
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
-            targets: List[str] = []
-            # Map MIME → iterable of XML files to inspect
-            if (
-                mime_type
-                == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            ):
+            parsed_members: dict[str, tuple[Any, dict[Any, dict[str, str]]]] = {}
+            shared_strings: Optional[List[str]] = None
+            if mime_type == _DOCX_MIME:
+                document = _parse_xml_with_choice_namespaces(
+                    _read_part(zf, "word/document.xml")
+                )
+                parsed_members["word/document.xml"] = document
                 targets = ["word/document.xml"]
-            elif (
-                mime_type
-                == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-            ):
+                targets.extend(_word_related_text_targets(zf, document[0]))
+            elif mime_type == _PPTX_MIME:
+                ET.fromstring(_read_part(zf, "ppt/presentation.xml"))
                 targets = [n for n in zf.namelist() if n.startswith("ppt/slides/slide")]
-            elif (
-                mime_type
-                == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            ):
+            else:
+                ET.fromstring(_read_part(zf, "xl/workbook.xml"))
                 targets = [
                     n
                     for n in zf.namelist()
                     if n.startswith("xl/worksheets/sheet") and "drawing" not in n
                 ]
-                # Attempt to parse sharedStrings.xml for Excel files
-                try:
-                    shared_strings_xml = zf.read("xl/sharedStrings.xml")
-                    shared_strings_root = ET.fromstring(shared_strings_xml)
-                    for si_element in shared_strings_root.findall(
-                        f"{{{ns_excel_main}}}si"
-                    ):
-                        text_parts = []
-                        # Find all <t> elements, simple or within <r> runs, and concatenate their text
-                        for t_element in si_element.findall(f".//{{{ns_excel_main}}}t"):
-                            if t_element.text:
-                                text_parts.append(t_element.text)
-                        shared_strings.append("".join(text_parts))
-                except KeyError:
-                    logger.info(
-                        "No sharedStrings.xml found in Excel file (this is optional)."
-                    )
-                except ET.ParseError as e:
-                    logger.error(f"Error parsing sharedStrings.xml: {e}")
-                except (
-                    Exception
-                ) as e:  # Catch any other unexpected error during sharedStrings parsing
-                    logger.error(
-                        f"Unexpected error processing sharedStrings.xml: {e}",
-                        exc_info=True,
-                    )
-            else:
-                return None
+                shared_strings = _read_shared_strings(zf)
 
             pieces: List[str] = []
             for member in targets:
-                try:
-                    xml_content = zf.read(member)
-                    xml_root = ET.fromstring(xml_content)
-                    member_texts: List[str] = []
+                if mime_type == _XLSX_MIME:
+                    xml_root = ET.fromstring(_read_part(zf, member))
+                    member_texts = _spreadsheet_texts(xml_root, shared_strings, member)
+                    sep = " "
+                else:
+                    xml_root, choice_namespaces = parsed_members.get(
+                        member
+                    ) or _parse_xml_with_choice_namespaces(_read_part(zf, member))
+                    member_texts = _paragraph_texts(xml_root, choice_namespaces)
+                    # Paragraph boundaries carry meaning; keep them as newlines.
+                    sep = "\n"
+                if member_texts:
+                    pieces.append(sep.join(member_texts))
 
-                    if (
-                        mime_type
-                        == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    ):
-                        for cell_element in xml_root.findall(
-                            f".//{{{ns_excel_main}}}c"
-                        ):  # Find all <c> elements
-                            value_element = cell_element.find(
-                                f"{{{ns_excel_main}}}v"
-                            )  # Find <v> under <c>
+            text = "\n\n".join(pieces).strip(" ")
+            return text or None
 
-                            # Skip if cell has no value element or value element has no text
-                            if value_element is None or value_element.text is None:
-                                continue
-
-                            cell_type = cell_element.get("t")
-                            if cell_type == "s":  # Shared string
-                                try:
-                                    ss_idx = int(value_element.text)
-                                    if 0 <= ss_idx < len(shared_strings):
-                                        member_texts.append(shared_strings[ss_idx])
-                                    else:
-                                        logger.warning(
-                                            f"Invalid shared string index {ss_idx} in {member}. Max index: {len(shared_strings) - 1}"
-                                        )
-                                except ValueError:
-                                    logger.warning(
-                                        f"Non-integer shared string index: '{value_element.text}' in {member}."
-                                    )
-                            else:  # Direct value (number, boolean, inline string if not 's')
-                                member_texts.append(value_element.text)
-                    else:  # Word or PowerPoint
-                        for elem in xml_root.iter():
-                            # For Word: <w:t> where w is "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-                            # For PowerPoint: <a:t> where a is "http://schemas.openxmlformats.org/drawingml/2006/main"
-                            if (
-                                elem.tag.endswith("}t") and elem.text
-                            ):  # Check for any namespaced tag ending with 't'
-                                cleaned_text = elem.text.strip()
-                                if (
-                                    cleaned_text
-                                ):  # Add only if there's non-whitespace text
-                                    member_texts.append(cleaned_text)
-
-                    if member_texts:
-                        pieces.append(
-                            " ".join(member_texts)
-                        )  # Join texts from one member with spaces
-
-                except ET.ParseError as e:
-                    logger.warning(
-                        f"Could not parse XML in member '{member}' for {mime_type} file: {e}"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Error processing member '{member}' for {mime_type}: {e}",
-                        exc_info=True,
-                    )
-                    # continue processing other members
-
-            if not pieces:  # If no text was extracted at all
-                return None
-
-            # Join content from different members (sheets/slides) with double newlines for separation
-            text = "\n\n".join(pieces).strip()
-            return text or None  # Ensure None is returned if text is empty after strip
-
-    except zipfile.BadZipFile:
+    except zipfile.BadZipFile as e:
         logger.warning(f"File is not a valid ZIP archive (mime_type: {mime_type}).")
-        return None
-    except (
-        ET.ParseError
-    ) as e:  # Catch parsing errors at the top level if zipfile itself is XML-like
-        logger.error(f"XML parsing error at a high level for {mime_type}: {e}")
-        return None
+        raise OfficeXmlExtractionError("not a valid Office file") from e
+    except (ET.ParseError, DefusedXmlException) as e:
+        raise OfficeXmlExtractionError("could not parse Office XML") from e
+    except OfficeXmlExtractionError:
+        raise
     except Exception as e:
         logger.error(
             f"Failed to extract office XML text for {mime_type}: {e}", exc_info=True
         )
+        raise OfficeXmlExtractionError("could not read Office file") from e
+
+
+IMAGE_MIME_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+    "image/tiff",
+    "image/svg+xml",
+}
+
+
+def extract_pdf_text(file_bytes: bytes) -> Optional[str]:
+    """
+    Extract text from a PDF using pypdf.
+    Returns plain text with pages separated by double newlines, or None on failure.
+    """
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(file_bytes))
+        pages = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                pages.append(text)
+        if not pages:
+            return None
+        return "\n\n".join(pages).strip() or None
+    except Exception as e:
+        logger.warning(f"Failed to extract PDF text: {e}")
         return None
+
+
+def encode_image_content(file_bytes: bytes, mime_type: str) -> str:
+    """
+    Base64-encode image bytes with a mime type metadata prefix.
+
+    Args:
+        file_bytes: The image file content as bytes.
+        mime_type: The MIME type of the image (must start with "image/").
+
+    Returns:
+        str: Base64-encoded image with mime type prefix.
+
+    Raises:
+        ValueError: If mime_type is not an image MIME type.
+    """
+    if not mime_type.startswith("image/"):
+        raise ValueError(
+            f"Expected image/* MIME type, got '{mime_type}'. "
+            "Only image content can be base64-encoded for multimodal clients."
+        )
+    encoded = base64.b64encode(file_bytes).decode("ascii")
+    return f"[base64_image:{mime_type}]{encoded}"
+
+
+_URL_QUERY_RE = re.compile(r"\?.*?(?=\s+returned(?:\s|$)|[>\"']|$)")
+
+
+def _scrub_url_queries(text: str) -> str:
+    """Strip query strings from any URL embedded in ``text`` before logging.
+
+    ``HttpError.__str__`` includes the full request URI, whose query string
+    carries user content (e.g. ``.../messages?q=<the user's search terms>``)
+    and can carry signed-URL secrets. The scheme/host/path identify the
+    failing endpoint, which is all the log needs.
+    """
+    return _URL_QUERY_RE.sub("?<query-redacted>", text)
+
+
+def _format_http_error_for_log(error: HttpError) -> str:
+    """Return operational HTTP failure context without response-body text."""
+    status = getattr(error.resp, "status", "unknown")
+    uri = getattr(error, "uri", None)
+    request = _scrub_url_queries(uri) if uri else "<unknown>"
+    return f"status={status}, request={request}"
 
 
 def handle_http_errors(
@@ -470,10 +904,19 @@ def handle_http_errors(
                         # Other HTTP errors (400 Bad Request, etc.) - don't suggest re-auth
                         message = f"API error in {tool_name}: {error}"
 
-                    logger.error(f"API error in {tool_name}: {error}", exc_info=True)
+                    # ERROR gets the scrubbed form (HttpError embeds the request
+                    # URI and may echo user content in its response details);
+                    # the full exception with traceback stays at DEBUG.
+                    logger.error(
+                        f"API error in {tool_name}: {_format_http_error_for_log(error)}"
+                    )
+                    logger.debug(f"API error detail in {tool_name}", exc_info=True)
                     raise Exception(message) from error
                 except TransientNetworkError:
                     # Re-raise without wrapping to preserve the specific error type
+                    raise
+                except ToolError:
+                    # Re-raise explicit tool errors so FastMCP can surface them directly.
                     raise
                 except GoogleAuthenticationError:
                     # Re-raise authentication errors without wrapping
