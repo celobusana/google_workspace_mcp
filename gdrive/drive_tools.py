@@ -713,7 +713,7 @@ async def download_drive_file(
         return f"Error: {exc}"
 
     extension, export_mime = export if export else (None, None)
-    filename = build_filename(name, extension)
+    filename = build_filename(name, extension, None if export else source_mime)
     max_bytes = get_download_max_bytes()
 
     declared_size = metadata.get("size")

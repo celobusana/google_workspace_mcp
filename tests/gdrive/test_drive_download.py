@@ -312,3 +312,68 @@ async def test_tool_is_read_only_without_structured_output():
     tool = await server.get_tool("download_drive_file")
     assert tool.output_schema is None
     assert tool.annotations.readOnlyHint is True
+
+
+@pytest.mark.parametrize(
+    "name,mime,expected",
+    [
+        ("Q3 v2.1", "application/pdf", "Q3 v2.1.pdf"),
+        ("report.pdf", "application/pdf", "report.pdf"),
+        ("REPORT.PDF", "application/pdf", "REPORT.PDF"),
+        ("photo", "image/jpeg", "photo.jpg"),
+        ("photo.jpeg", "image/jpeg", "photo.jpeg"),
+        ("deck", PPTX, "deck.pptx"),
+        ("name.", "application/pdf", "name.pdf"),
+        ("blob", "application/octet-stream", "blob"),
+        ("notes.custom", "application/octet-stream", "notes.custom"),
+    ],
+)
+def test_build_filename_infers_extension_from_mime(name, mime, expected):
+    assert build_filename(name, None, mime) == expected
+
+
+def test_build_filename_trailing_dot_with_export_extension():
+    assert build_filename("name.", "docx") == "name.docx"
+
+
+def test_build_filename_caps_length_and_keeps_extension():
+    result = build_filename("a" * 500 + ".pdf", None, "application/pdf")
+    assert len(result) == 200 and result.endswith(".pdf")
+    result = build_filename("b" * 500, "docx")
+    assert len(result) == 200 and result.endswith(".docx")
+
+
+@pytest.mark.asyncio
+async def test_shortcut_is_resolved_to_its_target(tmp_path):
+    items = {
+        "short1": {
+            "id": "short1",
+            "name": "link",
+            "mimeType": "application/vnd.google-apps.shortcut",
+            "shortcutDetails": {"targetId": "real1", "targetMimeType": PPTX},
+        },
+        "real1": {
+            "id": "real1",
+            "name": "deck.pptx",
+            "mimeType": PPTX,
+            "webViewLink": "https://drive/real1",
+            "size": "8",
+        },
+    }
+    service = Mock()
+    service.files.return_value.get.side_effect = lambda fileId, **_: Mock(
+        execute=lambda: items[fileId]
+    )
+    calls = []
+    with patch(
+        "gdrive.drive_tools._download_file_to_temp",
+        side_effect=_fake_download(b"PK\x03\x04data", calls, tmp_path),
+    ):
+        raw = await _unwrap(download_drive_file)(
+            service, "user@example.com", "short1", None
+        )
+    payload = json.loads(raw)
+    assert calls == [("real1", None)]
+    assert payload["filename"] == "deck.pptx"
+    assert payload["source"]["fileId"] == "real1"
+    assert payload["source"]["sourceMimeType"] == PPTX

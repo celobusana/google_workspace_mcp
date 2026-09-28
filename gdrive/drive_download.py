@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import json
+import mimetypes
+import os
 import re
 from typing import Optional
 
@@ -75,13 +77,65 @@ def resolve_export(
     return None
 
 
-def build_filename(name: str, extension: Optional[str]) -> str:
+_MAX_FILENAME_LENGTH = 200
+_MAX_EXTENSION_LENGTH = 16
+# mimetypes prefers odd extensions for some types (e.g. .jpe), so pin the common ones.
+_PREFERRED_EXTENSIONS = {
+    "application/pdf": ".pdf",
+    "image/jpeg": ".jpg",
+    "text/plain": ".txt",
+    "text/csv": ".csv",
+    "application/zip": ".zip",
+    "application/json": ".json",
+    _DOCX: ".docx",
+    _XLSX: ".xlsx",
+    _PPTX: ".pptx",
+}
+
+
+def _extension_for_mime(mime_type: str) -> Optional[tuple[str, set[str]]]:
+    # ".bin" says nothing about the content, so leave generic files as named.
+    if mime_type == "application/octet-stream":
+        return None
+    preferred = _PREFERRED_EXTENSIONS.get(mime_type) or mimetypes.guess_extension(
+        mime_type
+    )
+    if not preferred:
+        return None
+    return preferred, {preferred, *mimetypes.guess_all_extensions(mime_type)}
+
+
+def build_filename(
+    name: str, extension: Optional[str], source_mime: Optional[str] = None
+) -> str:
+    """Sanitize a Drive name and make sure it carries the extension of what is delivered.
+
+    ``extension`` is the export target for native files; for binaries, pass
+    ``source_mime`` so a missing extension is inferred from the mime type.
+    """
     # The filename becomes a path inside the sandbox.
     clean = _CONTROL_CHARS.sub("", _UNSAFE_PATH_CHARS.sub("-", name or "")).strip()
     if clean in ("", ".", ".."):
         clean = "download"
-    if extension and not clean.lower().endswith(f".{extension.lower()}"):
-        clean = f"{clean}.{extension}"
+
+    if extension:
+        target = f".{extension.lower()}"
+        if not clean.lower().endswith(target):
+            clean = f"{clean.rstrip('. ')}{target}"
+    elif source_mime:
+        inferred = _extension_for_mime(source_mime.lower())
+        if inferred:
+            preferred, accepted = inferred
+            suffix = os.path.splitext(clean)[1].lower()
+            # A dot in the name ("Q3 v2.1") is not an extension unless it is a known one.
+            if suffix not in accepted and suffix not in mimetypes.types_map:
+                clean = f"{clean.rstrip('. ')}{preferred}"
+
+    if len(clean) > _MAX_FILENAME_LENGTH:
+        stem, suffix = os.path.splitext(clean)
+        if len(suffix) > _MAX_EXTENSION_LENGTH:
+            stem, suffix = clean, ""
+        clean = f"{stem[: _MAX_FILENAME_LENGTH - len(suffix)]}{suffix}"
     return clean
 
 
