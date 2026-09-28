@@ -25,6 +25,7 @@ drive:
     - search_drive_files
     - get_drive_file_content
     - get_drive_file_download_url
+    - download_drive_file
     - create_drive_file
     - create_drive_folder
     - import_to_google_doc

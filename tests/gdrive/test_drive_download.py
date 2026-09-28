@@ -2,10 +2,14 @@
 
 import base64
 import json
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pytest
+from googleapiclient.errors import HttpError
 
 from core.file_limits import get_download_max_bytes
+from core.server import server
 from gdrive.drive_download import (
     DownloadNotSupportedError,
     build_filename,
@@ -13,6 +17,7 @@ from gdrive.drive_download import (
     resolve_export,
     too_large_message,
 )
+from gdrive.drive_tools import download_drive_file
 
 DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -133,3 +138,177 @@ def test_build_payload_roundtrip():
         "webViewLink": "https://docs.google.com/presentation/d/f1/edit",
         "exported": True,
     }
+
+
+def _unwrap(tool):
+    fn = tool.fn if hasattr(tool, "fn") else tool
+    while hasattr(fn, "__wrapped__"):
+        fn = fn.__wrapped__
+    return fn
+
+
+def _meta(name, mime, size=None):
+    meta = {"name": name, "mimeType": mime, "webViewLink": "https://drive/x"}
+    if size is not None:
+        meta["size"] = str(size)
+    return meta
+
+
+def _fake_download(content: bytes, calls: list, tmp_dir: Path):
+    async def _download(service, file_id, export_mime_type=None):
+        calls.append((file_id, export_mime_type))
+        tmp = tmp_dir / f"dl_{len(calls)}"
+        tmp.write_bytes(content)
+        return tmp
+
+    return _download
+
+
+async def _call(
+    tmp_dir, meta, content=b"PK\x03\x04data", export_format=None, calls=None
+):
+    calls = [] if calls is None else calls
+    with (
+        patch("gdrive.drive_tools.resolve_drive_item", return_value=("f1", meta)),
+        patch(
+            "gdrive.drive_tools._download_file_to_temp",
+            side_effect=_fake_download(content, calls, tmp_dir),
+        ),
+    ):
+        return await _unwrap(download_drive_file)(
+            Mock(), "user@example.com", "f1", export_format
+        )
+
+
+@pytest.mark.asyncio
+async def test_binary_pptx_returns_original_bytes(tmp_path):
+    calls = []
+    raw = await _call(tmp_path, _meta("deck.pptx", PPTX, 8), calls=calls)
+    payload = json.loads(raw)
+    assert calls == [("f1", None)]
+    assert payload["filename"] == "deck.pptx"
+    assert payload["mimeType"] == PPTX
+    assert payload["storeAsFile"] is True
+    assert base64.b64decode(payload["base64Data"]) == b"PK\x03\x04data"
+    assert payload["source"]["exported"] is False
+    assert payload["source"]["provider"] == "googledrive"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source,fmt,ext,mime",
+    [
+        ("application/vnd.google-apps.presentation", None, "pptx", PPTX),
+        ("application/vnd.google-apps.document", None, "docx", DOCX),
+        ("application/vnd.google-apps.spreadsheet", None, "xlsx", XLSX),
+        ("application/vnd.google-apps.presentation", "pdf", "pdf", "application/pdf"),
+    ],
+)
+async def test_native_exports(tmp_path, source, fmt, ext, mime):
+    calls = []
+    raw = await _call(
+        tmp_path, _meta("Q3 v2.1 plan", source), export_format=fmt, calls=calls
+    )
+    payload = json.loads(raw)
+    assert calls == [("f1", mime)]
+    assert payload["filename"] == f"Q3 v2.1 plan.{ext}"
+    assert payload["mimeType"] == mime
+    assert payload["source"]["exported"] is True
+    assert payload["source"]["sourceMimeType"] == source
+
+
+@pytest.mark.asyncio
+async def test_invalid_export_format_errors_without_download(tmp_path):
+    calls = []
+    raw = await _call(
+        tmp_path,
+        _meta("Doc", "application/vnd.google-apps.document"),
+        export_format="pptx",
+        calls=calls,
+    )
+    assert raw.startswith("Error:") and "Allowed values" in raw
+    assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mime", ["application/vnd.google-apps.form", "application/vnd.google-apps.folder"]
+)
+async def test_unsupported_types_error_without_download(tmp_path, mime):
+    calls = []
+    raw = await _call(tmp_path, _meta("X", mime), calls=calls)
+    assert raw == "Error: This file type cannot be downloaded."
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_metadata_size_over_limit_skips_download(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_MCP_DOWNLOAD_MAX_BYTES", "4")
+    calls = []
+    raw = await _call(tmp_path, _meta("big.pdf", "application/pdf", 10), calls=calls)
+    assert raw.startswith("Error:") and "download limit" in raw
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_export_over_limit_removes_temp_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_MCP_DOWNLOAD_MAX_BYTES", "4")
+    raw = await _call(
+        tmp_path,
+        _meta("Deck", "application/vnd.google-apps.presentation"),
+        content=b"0123456789",
+    )
+    assert raw.startswith("Error:") and "download limit" in raw
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_temp_file_removed_on_success(tmp_path):
+    await _call(tmp_path, _meta("deck.pptx", PPTX, 8))
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_temp_file_removed_when_read_fails(tmp_path):
+    with (
+        patch(
+            "gdrive.drive_tools.resolve_drive_item",
+            return_value=("f1", _meta("deck.pptx", PPTX, 8)),
+        ),
+        patch(
+            "gdrive.drive_tools._download_file_to_temp",
+            side_effect=_fake_download(b"abc", [], tmp_path),
+        ),
+        patch("gdrive.drive_tools.asyncio.to_thread", side_effect=OSError("boom")),
+    ):
+        with pytest.raises(OSError):
+            await _unwrap(download_drive_file)(Mock(), "u@example.com", "f1", None)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_export_size_limit_exceeded_is_explained():
+    err = HttpError(
+        Mock(status=403, reason="Forbidden"),
+        b'{"error": {"errors": [{"reason": "exportSizeLimitExceeded"}]}}',
+    )
+    with (
+        patch(
+            "gdrive.drive_tools.resolve_drive_item",
+            return_value=(
+                "f1",
+                _meta("Deck", "application/vnd.google-apps.presentation"),
+            ),
+        ),
+        patch("gdrive.drive_tools._download_file_to_temp", side_effect=err),
+    ):
+        raw = await _unwrap(download_drive_file)(Mock(), "u@example.com", "f1", None)
+    assert raw.startswith("Error:") and "10 MB" in raw
+
+
+@pytest.mark.asyncio
+async def test_tool_is_read_only_without_structured_output():
+    # A structured copy would send the base64 payload twice.
+    tool = await server.get_tool("download_drive_file")
+    assert tool.output_schema is None
+    assert tool.annotations.readOnlyHint is True

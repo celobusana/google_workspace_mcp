@@ -28,6 +28,7 @@ from core.file_limits import (
     FileTooLargeError,
     download_media_bytes,
     ensure_within_file_size_limit,
+    get_download_max_bytes,
 )
 from core.utils import (
     GOOGLE_API_WRITE_RETRIES,
@@ -41,6 +42,13 @@ from core.utils import (
 )
 from core.server import server
 from core.config import get_transport_mode
+from gdrive.drive_download import (
+    DownloadNotSupportedError,
+    build_filename,
+    build_payload,
+    resolve_export,
+    too_large_message,
+)
 from gdrive.drive_helpers import (
     DRIVE_QUERY_PATTERNS,
     FOLDER_MIME_TYPE,
@@ -652,6 +660,93 @@ async def get_drive_file_download_url(
             f"File was downloaded successfully ({size_kb:.1f} KB) but could not be saved.\n\n"
             f"Error details: {str(e)}"
         )
+
+
+@server.tool(
+    title="Download Drive File For Editing",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+    # A structured copy would send the base64 payload twice.
+    output_schema=None,
+)
+@handle_http_errors("download_drive_file", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_read")
+async def download_drive_file(
+    service,
+    user_google_email: str,
+    file_id: str,
+    export_format: Optional[str] = None,
+) -> str:
+    """
+    Stores the original Google Drive file in Quintus Drive so it can be loaded into the
+    sandbox to edit or manipulate it. Use this only when the file itself is needed.
+    To read, summarize or quote a file's content, use get_drive_file_content instead.
+
+    Google native files are exported to the matching Office format by default:
+    Docs -> docx, Sheets -> xlsx, Slides -> pptx, Drawings -> png.
+    Other files are returned as-is. Limit: 15 MB.
+
+    Args:
+        user_google_email: The user's Google email address. Required.
+        file_id: The Google Drive file ID.
+        export_format: Optional, Google native files only.
+            Docs: docx, pdf, odt, txt. Sheets: xlsx, csv, pdf, ods.
+            Slides: pptx, pdf, odp. Drawings: png, pdf, svg.
+
+    Returns:
+        str: The stored file reference, or an error message.
+    """
+    resolved_id, metadata = await resolve_drive_item(
+        service, file_id, extra_fields="name, webViewLink, mimeType, size"
+    )
+    source_mime = metadata.get("mimeType", "")
+    name = metadata.get("name", "download")
+    web_view_link = metadata.get("webViewLink")
+
+    try:
+        export = resolve_export(source_mime, export_format)
+    except DownloadNotSupportedError as exc:
+        return f"Error: {exc}"
+
+    extension, export_mime = export if export else (None, None)
+    filename = build_filename(name, extension)
+    max_bytes = get_download_max_bytes()
+
+    declared_size = metadata.get("size")
+    if declared_size is not None and int(declared_size) > max_bytes:
+        return too_large_message(filename, int(declared_size), max_bytes)
+
+    try:
+        tmp_path = await _download_file_to_temp(service, resolved_id, export_mime)
+    except HttpError as exc:
+        if "exportSizeLimitExceeded" in str(exc.content or b""):
+            return (
+                f'Error: Google refuses to export "{filename}": exports over 10 MB '
+                "are not allowed. Ask the user to download it from Drive instead."
+            )
+        raise
+
+    try:
+        size = tmp_path.stat().st_size
+        if size > max_bytes:
+            return too_large_message(filename, size, max_bytes)
+        data = await asyncio.to_thread(tmp_path.read_bytes)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    return build_payload(
+        filename=filename,
+        mime_type=export_mime or source_mime or "application/octet-stream",
+        data=data,
+        file_id=resolved_id,
+        source_mime=source_mime,
+        web_view_link=web_view_link,
+        exported=export is not None,
+    )
 
 
 @server.tool(
