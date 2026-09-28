@@ -5,11 +5,11 @@ import json
 
 import pytest
 
+from core.file_limits import get_download_max_bytes
 from gdrive.drive_download import (
     DownloadNotSupportedError,
     build_filename,
     build_payload,
-    get_download_max_bytes,
     resolve_export,
     too_large_message,
 )
@@ -65,6 +65,12 @@ def test_resolve_export_rejects_non_exportable_native(source):
         ("bad\x00\x1fname.pdf", None, "badname.pdf"),
         ("   ", "docx", "download.docx"),
         ("report.pdf", None, "report.pdf"),
+        ("..", None, "download"),
+        (".", "docx", "download.docx"),
+        ("a\x85b\x9fc", None, "abc"),
+        ("a\u2028b\u2029c", None, "abc"),
+        ("evil\u202egpj.exe", None, "evilgpj.exe"),
+        ("x\u2066y\u2069z", None, "xyz"),
     ],
 )
 def test_build_filename(name, ext, expected):
@@ -92,6 +98,16 @@ def test_too_large_message():
     msg = too_large_message("big.pptx", 20 * 1024 * 1024, 15 * 1024 * 1024)
     assert msg.startswith("Error:")
     assert "big.pptx" in msg and "20.0 MB" in msg and "15 MB" in msg
+
+
+def test_too_large_message_small_cap():
+    msg = too_large_message("a.bin", 2048, 1024)
+    assert "2.0 KB" in msg and "limit is 1 KB" in msg
+
+
+def test_too_large_message_fractional_cap():
+    msg = too_large_message("a.bin", 5 * 1024 * 1024, int(1.5 * 1024 * 1024))
+    assert "limit is 1.5 MB" in msg
 
 
 def test_build_payload_roundtrip():

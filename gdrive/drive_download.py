@@ -7,14 +7,11 @@ import json
 import re
 from typing import Optional
 
-from core.file_limits import get_download_max_bytes
-
 _DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _PPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 _PDF = "application/pdf"
 
-# Google native type -> (default extension, {extension: export mime})
 _EXPORTS: dict[str, tuple[str, dict[str, str]]] = {
     "application/vnd.google-apps.document": (
         "docx",
@@ -50,16 +47,10 @@ _EXPORTS: dict[str, tuple[str, dict[str, str]]] = {
 
 _GOOGLE_NATIVE_PREFIX = "application/vnd.google-apps."
 _UNSAFE_PATH_CHARS = re.compile(r"[/\\]")
-_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
-
-__all__ = [
-    "DownloadNotSupportedError",
-    "build_filename",
-    "build_payload",
-    "get_download_max_bytes",
-    "resolve_export",
-    "too_large_message",
-]
+# C0/C1 controls, line/paragraph separators and bidi overrides can spoof or break the sandbox path.
+_CONTROL_CHARS = re.compile(
+    "[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]"
+)
 
 
 class DownloadNotSupportedError(ValueError):
@@ -87,18 +78,29 @@ def resolve_export(
 def build_filename(name: str, extension: Optional[str]) -> str:
     # The filename becomes a path inside the sandbox.
     clean = _CONTROL_CHARS.sub("", _UNSAFE_PATH_CHARS.sub("-", name or "")).strip()
-    if not clean:
+    if clean in ("", ".", ".."):
         clean = "download"
     if extension and not clean.lower().endswith(f".{extension.lower()}"):
         clean = f"{clean}.{extension}"
     return clean
 
 
+def _format_size(num_bytes: int, *, trim: bool = False) -> str:
+    value, unit = (
+        (num_bytes / (1024 * 1024), "MB")
+        if num_bytes >= 1024 * 1024
+        else (num_bytes / 1024, "KB")
+    )
+    text = f"{value:.1f}"
+    if trim and text.endswith(".0"):
+        text = text[:-2]
+    return f"{text} {unit}"
+
+
 def too_large_message(file_name: str, size_bytes: int, max_bytes: int) -> str:
-    mb = 1024 * 1024
     return (
-        f'Error: "{file_name}" is {size_bytes / mb:.1f} MB; '
-        f"the download limit is {max_bytes / mb:.0f} MB."
+        f'Error: "{file_name}" is {_format_size(size_bytes)}; '
+        f"the download limit is {_format_size(max_bytes, trim=True)}."
     )
 
 
