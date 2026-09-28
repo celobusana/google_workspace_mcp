@@ -65,6 +65,30 @@ def get_max_file_bytes() -> Optional[int]:
     return value
 
 
+_DOWNLOAD_ENV_NAME = "WORKSPACE_MCP_DOWNLOAD_MAX_BYTES"
+# base64 inflates the payload by a third and it crosses two memory-bounded services.
+DEFAULT_DOWNLOAD_MAX_BYTES = 15 * 1024 * 1024
+
+
+def get_download_max_bytes() -> int:
+    """Return the size cap for ``download_drive_file`` (default 15 MiB).
+
+    Unlike ``get_max_file_bytes`` this cap is always on, so ``0`` is invalid.
+    """
+    raw = os.getenv(_DOWNLOAD_ENV_NAME)
+    if raw is None or raw.strip() == "":
+        return DEFAULT_DOWNLOAD_MAX_BYTES
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        value = 0
+    if value <= 0:
+        raise ValueError(
+            f"Invalid {_DOWNLOAD_ENV_NAME}={raw!r}; expected a positive byte count."
+        )
+    return value
+
+
 def format_file_too_large_message(
     *,
     size_bytes: int,
