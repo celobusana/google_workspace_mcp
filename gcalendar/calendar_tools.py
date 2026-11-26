@@ -10,7 +10,7 @@ import asyncio
 import re
 import uuid
 import json
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Literal, Optional, Dict, Any, Union
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pytz
@@ -1432,7 +1432,7 @@ async def manage_event(
     guests_can_see_other_guests: Optional[bool] = None,
     response: Optional[str] = None,
     rsvp_comment: Optional[str] = None,
-    send_updates: Optional[str] = None,
+    send_updates: Optional[Literal["all", "externalOnly", "none"]] = None,
     *,
     start_timezone: Optional[str] = None,
     end_timezone: Optional[str] = None,

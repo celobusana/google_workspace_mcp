@@ -72,7 +72,12 @@ from gdocs.docs_markdown import (
 )
 from gdocs.docs_markdown_writer import markdown_to_docs_requests
 from gdocs.docs_plain_text import render_doc_to_plain_text
-from gdocs.operation_schemas import BatchDocOperations, ParagraphBorderEdge
+from gdocs.operation_schemas import (
+    BaselineOffset,
+    BatchDocOperations,
+    ListType,
+    ParagraphBorderEdge,
+)
 
 # Import operation managers for complex business logic
 from gdocs.managers import (
@@ -534,7 +539,7 @@ async def modify_doc_text(
     background_color: str = None,
     link_url: str = None,
     clear_link: bool = None,
-    baseline_offset: str = None,
+    baseline_offset: BaselineOffset = None,
     small_caps: bool = None,
 ) -> str:
     """
@@ -2292,7 +2297,7 @@ async def update_paragraph_style(
     border_width: float = None,
     border_padding: float = None,
     border_dash: str = None,
-    list_type: str = None,
+    list_type: ListType = None,
     list_nesting_level: int = None,
     bullet_preset: str = None,
 ) -> str:
@@ -2603,7 +2608,7 @@ async def get_doc_as_markdown(
     user_google_email: str,
     document_id: str,
     include_comments: bool = True,
-    comment_mode: str = "inline",
+    comment_mode: Literal["inline", "appendix", "none"] = "inline",
     include_resolved: bool = False,
     suggestions_view_mode: str = "DEFAULT_FOR_CURRENT_ACCESS",
     tab_id: Optional[str] = None,
