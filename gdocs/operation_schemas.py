@@ -17,6 +17,18 @@ ParagraphBorderEdge = Literal["top", "bottom", "left", "right", "between"]
 TableBorderEdge = Literal["top", "bottom", "left", "right"]
 
 
+def _upper(v: Any) -> Any:
+    return v.upper() if isinstance(v, str) else v
+
+
+ListType = Annotated[
+    Literal["UNORDERED", "ORDERED", "CHECKBOX", "NONE"], BeforeValidator(_upper)
+]
+BaselineOffset = Annotated[
+    Literal["NONE", "SUPERSCRIPT", "SUBSCRIPT"], BeforeValidator(_upper)
+]
+
+
 def _coerce_json_str_to_list(v: Any) -> Any:
     """Accept JSON-encoded lists for MCP clients that serialize arrays as strings."""
     if not isinstance(v, str):

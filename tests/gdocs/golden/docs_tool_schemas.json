@@ -96,6 +96,11 @@
       },
       "baseline_offset": {
         "default": null,
+        "enum": [
+          "NONE",
+          "SUPERSCRIPT",
+          "SUBSCRIPT"
+        ],
         "type": "string",
         "description": "One of NONE, SUPERSCRIPT, SUBSCRIPT"
       },
